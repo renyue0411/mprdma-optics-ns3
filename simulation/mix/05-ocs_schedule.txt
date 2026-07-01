@@ -1,0 +1,16 @@
+# ocs_id slice logical_port_a logical_port_b
+# 4-port OCS one-factorization
+
+4 0 0 1
+4 0 2 3
+4 1 0 2
+4 1 1 3
+4 2 0 3
+4 2 1 2
+
+5 0 0 1
+5 0 2 3
+5 1 0 2
+5 1 1 3
+5 2 0 3
+5 2 1 2
