@@ -1,6 +1,8 @@
-# ocs_id slice logical_port_a logical_port_b
-# 4-port OCS one-factorization
+# CONFIG ocs_id epoch_start_us slice_duration_us switching_time_us num_slices
+CONFIG 4 0 10000 10 3
+CONFIG 5 0 10000 10 3
 
+# ocs_id slice logical_port_a logical_port_b
 4 0 0 1
 4 0 2 3
 4 1 0 2

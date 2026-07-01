@@ -70,10 +70,16 @@ std::string ocs_map_file = "";
 // and installs a periodic time-sliced OCS schedule with switching blackout.
 uint32_t ocs_schedule_enable = 0;
 std::string ocs_schedule_file = "";
-uint32_t ocs_slice_duration_us = 100000;
-uint32_t ocs_switching_time_us = 10;
-uint32_t ocs_epoch_start_us = 0;
-uint32_t ocs_num_slices = 1;
+
+struct OcsScheduleConfig
+{
+    uint32_t epochStartUs;
+    uint32_t sliceDurationUs;
+    uint32_t switchingTimeUs;
+    uint32_t numSlices;
+};
+
+std::map<uint32_t, OcsScheduleConfig> ocsScheduleConfigs;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -828,26 +834,6 @@ int main(int argc, char *argv[])
 				conf >> ocs_schedule_file;
 				std::cout << "OCS_SCHEDULE_FILE\t\t" << ocs_schedule_file << "\n";
 			}
-			else if (key.compare("OCS_SLICE_DURATION_US") == 0)
-			{
-				conf >> ocs_slice_duration_us;
-				std::cout << "OCS_SLICE_DURATION_US\t\t" << ocs_slice_duration_us << "\n";
-			}
-			else if (key.compare("OCS_SWITCHING_TIME_US") == 0)
-			{
-				conf >> ocs_switching_time_us;
-				std::cout << "OCS_SWITCHING_TIME_US\t" << ocs_switching_time_us << "\n";
-			}
-			else if (key.compare("OCS_EPOCH_START_US") == 0)
-			{
-				conf >> ocs_epoch_start_us;
-				std::cout << "OCS_EPOCH_START_US\t\t" << ocs_epoch_start_us << "\n";
-			}
-			else if (key.compare("OCS_NUM_SLICES") == 0)
-			{
-				conf >> ocs_num_slices;
-				std::cout << "OCS_NUM_SLICES\t\t" << ocs_num_slices << "\n";
-			}
 			fflush(stdout);
 		}
 		conf.close();
@@ -1483,18 +1469,15 @@ void LoadOcsInitialMapping(NodeContainer &n)
 
 void LoadOcsSchedule(NodeContainer &n)
 {
-    if (ocs_schedule_file.empty()) {
+    if (ocs_schedule_file.empty())
+    {
         std::cout << "[OCS SCHEDULE] no schedule file configured" << std::endl;
         return;
     }
 
-    NS_ASSERT_MSG(ocs_num_slices > 0, "OCS_NUM_SLICES must be larger than 0");
-    NS_ASSERT_MSG(ocs_slice_duration_us > 0, "OCS_SLICE_DURATION_US must be larger than 0");
-    NS_ASSERT_MSG(ocs_switching_time_us < ocs_slice_duration_us,
-                  "OCS_SWITCHING_TIME_US must be smaller than OCS_SLICE_DURATION_US");
-
     std::ifstream fin(ocs_schedule_file.c_str());
-    if (!fin.is_open()) {
+    if (!fin.is_open())
+    {
         std::cout << "Cannot open OCS_SCHEDULE_FILE: " << ocs_schedule_file << std::endl;
         return;
     }
@@ -1505,38 +1488,106 @@ void LoadOcsSchedule(NodeContainer &n)
     // ocsId -> vector<(slice, (actualIfA, actualIfB))>
     std::map<uint32_t, std::vector<SliceCircuit> > scheduleEntries;
 
+    // ocsId -> slice -> used logical ports
+    std::map<uint32_t, std::map<uint32_t, std::set<uint32_t> > > usedLogicalPorts;
+
+    ocsScheduleConfigs.clear();
+
     std::string line;
     uint32_t lineNo = 0;
 
-    while (std::getline(fin, line)) {
+    while (std::getline(fin, line))
+    {
         lineNo++;
 
         // Remove inline comments.
         size_t commentPos = line.find('#');
-        if (commentPos != std::string::npos) {
+        if (commentPos != std::string::npos)
+        {
             line = line.substr(0, commentPos);
         }
 
         std::stringstream ss(line);
+        std::string first;
+
+        if (!(ss >> first))
+        {
+            continue; // empty line
+        }
+
+        if (first == "CONFIG" || first == "config")
+        {
+            uint32_t ocsId;
+            OcsScheduleConfig cfg;
+
+            if (!(ss >> ocsId
+                     >> cfg.epochStartUs
+                     >> cfg.sliceDurationUs
+                     >> cfg.switchingTimeUs
+                     >> cfg.numSlices))
+            {
+                NS_ASSERT_MSG(false,
+                              "Invalid OCS CONFIG line at line " << lineNo);
+            }
+
+            std::string extra;
+            if (ss >> extra)
+            {
+                std::cout << "[WARN] Extra field in OCS CONFIG at line "
+                          << lineNo << ": " << extra << std::endl;
+            }
+
+            NS_ASSERT_MSG(ocsId < n.GetN(), "OCS CONFIG points to invalid node id");
+            NS_ASSERT_MSG(ocs_node_ids.find(ocsId) != ocs_node_ids.end(),
+                          "OCS CONFIG points to a non-OCS node");
+            NS_ASSERT_MSG(cfg.numSlices > 0,
+                          "OCS CONFIG num_slices must be larger than 0");
+            NS_ASSERT_MSG(cfg.sliceDurationUs > 0,
+                          "OCS CONFIG slice_duration_us must be larger than 0");
+            NS_ASSERT_MSG(cfg.switchingTimeUs < cfg.sliceDurationUs,
+                          "OCS CONFIG switching_time_us must be smaller than slice_duration_us");
+
+            if (ocsScheduleConfigs.find(ocsId) != ocsScheduleConfigs.end())
+            {
+                NS_ASSERT_MSG(false,
+                              "Duplicate OCS CONFIG for node " << ocsId);
+            }
+
+            ocsScheduleConfigs[ocsId] = cfg;
+
+            std::cout << "[LOAD OCS CONFIG] OCS " << ocsId
+                      << " epoch_start_us=" << cfg.epochStartUs
+                      << " slice_duration_us=" << cfg.sliceDurationUs
+                      << " switching_time_us=" << cfg.switchingTimeUs
+                      << " num_slices=" << cfg.numSlices
+                      << std::endl;
+
+            continue;
+        }
+
+        // Otherwise, parse a normal schedule entry:
+        // ocs_id slice logical_port_a logical_port_b
+        std::stringstream lineSs(line);
 
         uint32_t ocsId;
         uint32_t slice;
         uint32_t logicalPortA;
         uint32_t logicalPortB;
 
-        // Ignore empty and comment-only lines.
-        if (!(ss >> ocsId >> slice >> logicalPortA >> logicalPortB)) {
-            continue;
+        if (!(lineSs >> ocsId >> slice >> logicalPortA >> logicalPortB))
+        {
+            NS_ASSERT_MSG(false,
+                          "Invalid OCS schedule line at line " << lineNo);
         }
 
         std::string extra;
-        if (ss >> extra) {
+        if (lineSs >> extra)
+        {
             std::cout << "[WARN] Extra field in OCS_SCHEDULE_FILE at line "
                       << lineNo << ": " << extra << std::endl;
         }
 
         NS_ASSERT_MSG(ocsId < n.GetN(), "OCS schedule points to invalid node id");
-        NS_ASSERT_MSG(slice < ocs_num_slices, "OCS schedule slice out of range");
 
         Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(ocsId));
         NS_ASSERT_MSG(ocs != 0, "OCS_SCHEDULE_FILE points to a non-OCS node");
@@ -1551,6 +1602,25 @@ void LoadOcsSchedule(NodeContainer &n)
             "OCS schedule logical port B not found"
         );
 
+        NS_ASSERT_MSG(logicalPortA != logicalPortB,
+                      "OCS schedule cannot connect a port to itself");
+
+        // Check one OCS port is used at most once in one slice.
+        NS_ASSERT_MSG(
+            usedLogicalPorts[ocsId][slice].find(logicalPortA) ==
+                usedLogicalPorts[ocsId][slice].end(),
+            "OCS schedule reuses logical port A in the same slice"
+        );
+
+        NS_ASSERT_MSG(
+            usedLogicalPorts[ocsId][slice].find(logicalPortB) ==
+                usedLogicalPorts[ocsId][slice].end(),
+            "OCS schedule reuses logical port B in the same slice"
+        );
+
+        usedLogicalPorts[ocsId][slice].insert(logicalPortA);
+        usedLogicalPorts[ocsId][slice].insert(logicalPortB);
+
         uint32_t actualIfA = logicalPortToIf[ocsId][logicalPortA];
         uint32_t actualIfB = logicalPortToIf[ocsId][logicalPortB];
 
@@ -1563,48 +1633,73 @@ void LoadOcsSchedule(NodeContainer &n)
                   << "(if " << actualIfB << ")"
                   << std::endl;
 
-        // One schedule line describes one bidirectional circuit in a given slice.
-        // The actual bidirectional entries are installed later by OcsNode.
         scheduleEntries[ocsId].push_back(
             std::make_pair(slice, std::make_pair(actualIfA, actualIfB))
         );
     }
 
+    fin.close();
+
+    // Install schedules.
     for (std::map<uint32_t, std::vector<SliceCircuit> >::iterator it = scheduleEntries.begin();
-         it != scheduleEntries.end(); ++it) {
+         it != scheduleEntries.end(); ++it)
+    {
         uint32_t id = it->first;
 
         Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(id));
         NS_ASSERT_MSG(ocs != 0, "OCS schedule points to a non-OCS node");
 
-        ocs->ConfigureSchedule(MicroSeconds(ocs_epoch_start_us),
-                               MicroSeconds(ocs_slice_duration_us),
-                               ocs_num_slices,
-                               MicroSeconds(ocs_switching_time_us));
+        std::map<uint32_t, OcsScheduleConfig>::iterator cfgIt =
+            ocsScheduleConfigs.find(id);
+
+        NS_ASSERT_MSG(cfgIt != ocsScheduleConfigs.end(),
+                      "Missing CONFIG line for scheduled OCS node");
+
+        OcsScheduleConfig cfg = cfgIt->second;
+
+        ocs->ConfigureSchedule(MicroSeconds(cfg.epochStartUs),
+                               MicroSeconds(cfg.sliceDurationUs),
+                               cfg.numSlices,
+                               MicroSeconds(cfg.switchingTimeUs));
 
         ocs->ClearSchedule();
 
-        for (uint32_t i = 0; i < it->second.size(); ++i) {
+        for (uint32_t i = 0; i < it->second.size(); ++i)
+        {
             uint32_t slice = it->second[i].first;
             uint32_t actualIfA = it->second[i].second.first;
             uint32_t actualIfB = it->second[i].second.second;
+
+            NS_ASSERT_MSG(slice < cfg.numSlices,
+                          "OCS schedule slice index exceeds num_slices");
 
             ocs->AddBidirectionalScheduleEntry(actualIfA, actualIfB, slice);
         }
 
         std::cout << "[OCS SCHEDULE INSTALLED] node=" << id
                   << " entries=" << it->second.size()
-                  << " num_slices=" << ocs_num_slices
-                  << " slice_duration_us=" << ocs_slice_duration_us
-                  << " switching_time_us=" << ocs_switching_time_us
+                  << " epoch_start_us=" << cfg.epochStartUs
+                  << " num_slices=" << cfg.numSlices
+                  << " slice_duration_us=" << cfg.sliceDurationUs
+                  << " switching_time_us=" << cfg.switchingTimeUs
                   << std::endl;
     }
 
+    // Warn about OCS nodes that have no schedule entries.
     for (std::set<uint32_t>::iterator it = ocs_node_ids.begin();
-         it != ocs_node_ids.end(); ++it) {
-        if (scheduleEntries.find(*it) == scheduleEntries.end()) {
+         it != ocs_node_ids.end(); ++it)
+    {
+        if (scheduleEntries.find(*it) == scheduleEntries.end())
+        {
             std::cout << "[WARN] OCS " << *it
                       << " has no schedule entries"
+                      << std::endl;
+        }
+
+        if (ocsScheduleConfigs.find(*it) == ocsScheduleConfigs.end())
+        {
+            std::cout << "[WARN] OCS " << *it
+                      << " has no CONFIG line"
                       << std::endl;
         }
     }
