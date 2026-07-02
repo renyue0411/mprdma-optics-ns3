@@ -33,6 +33,7 @@ def build(bld):
         'model/mp-switch-node.cc',
         'model/ocs-node.cc',
         'model/rdma-transport-control.cc',
+        'model/rdma-ocs-controller.cc',
         ]
 
     module_test = bld.create_ns3_module_test_library('point-to-point')
@@ -74,6 +75,7 @@ def build(bld):
         'model/mp-switch-node.h',
         'model/ocs-node.h',
         'model/rdma-transport-control.h',
+        'model/rdma-ocs-controller.h',
         ]
 
     if (bld.env['ENABLE_EXAMPLES']):
