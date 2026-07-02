@@ -89,7 +89,6 @@ RdmaTransportControl::GetNextQindex(Ptr<RdmaQueuePairGroup> qpGrp,
     }
 
   return res;
-  
-}
 
+}
 } // namespace ns3
