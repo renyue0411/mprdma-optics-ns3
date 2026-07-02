@@ -184,8 +184,8 @@ namespace ns3
 	{
 		m_rnicGateEnabled = false;
 		m_rnicGateRnicId = 0;
-		m_rnicGateEpochStartUs = 0;
-		m_rnicGatePeriodUs = 0;
+		m_rnicGateEpochStartNs = 0;
+		m_rnicGatePeriodNs = 0;
 	}
 
 	void RdmaHw::SetNode(Ptr<Node> node)
@@ -214,17 +214,17 @@ namespace ns3
 		m_qpCompleteCallback = cb;
 	}
 
-	void RdmaHw::EnableRnicGate(uint32_t rnicId, uint64_t epochStartUs, uint64_t periodUs, const std::vector<RnicGateSlotEntry> &slots)
+	void RdmaHw::EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots)
 	{
 		m_rnicGateEnabled = true;
 		m_rnicGateRnicId = rnicId;
-		m_rnicGateEpochStartUs = epochStartUs;
-		m_rnicGatePeriodUs = periodUs;
+		m_rnicGateEpochStartNs = epochStartNs;
+		m_rnicGatePeriodNs = periodNs;
 		m_rnicGateSlots = slots;
 
 		std::cout << "[RNIC GATE INSTALLED] rnic=" << rnicId
-				  << " epochUs=" << epochStartUs
-				  << " periodUs=" << periodUs
+				  << " epochNs=" << epochStartNs
+				  << " periodNs=" << periodNs
 				  << " slots=" << slots.size()
 				  << std::endl;
 	}
@@ -237,21 +237,21 @@ namespace ns3
 
 	bool RdmaHw::RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const
 	{
-		if (!m_rnicGateEnabled || m_rnicGatePeriodUs == 0 || qp == 0)
+		if (!m_rnicGateEnabled || m_rnicGatePeriodNs == 0 || qp == 0)
 		{
 			return true;
 		}
 
 		uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-		uint64_t nowUs = static_cast<uint64_t>(Simulator::Now().GetMicroSeconds());
-		uint64_t offsetUs = nowUs >= m_rnicGateEpochStartUs ?
-			(nowUs - m_rnicGateEpochStartUs) % m_rnicGatePeriodUs :
-			(m_rnicGatePeriodUs - ((m_rnicGateEpochStartUs - nowUs) % m_rnicGatePeriodUs)) % m_rnicGatePeriodUs;
+		uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+		uint64_t offsetNs = nowNs >= m_rnicGateEpochStartNs ?
+			(nowNs - m_rnicGateEpochStartNs) % m_rnicGatePeriodNs :
+			(m_rnicGatePeriodNs - ((m_rnicGateEpochStartNs - nowNs) % m_rnicGatePeriodNs)) % m_rnicGatePeriodNs;
 
 		for (uint32_t i = 0; i < m_rnicGateSlots.size(); ++i)
 		{
 			const RnicGateSlotEntry &slot = m_rnicGateSlots[i];
-			if (offsetUs < slot.startOffsetUs || offsetUs >= slot.endOffsetUs)
+			if (offsetNs < slot.startOffsetNs || offsetNs >= slot.endOffsetNs)
 			{
 				continue;
 			}
@@ -270,18 +270,18 @@ namespace ns3
 
 	Time RdmaHw::GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const
 	{
-		if (!m_rnicGateEnabled || m_rnicGatePeriodUs == 0 || qp == 0)
+		if (!m_rnicGateEnabled || m_rnicGatePeriodNs == 0 || qp == 0)
 		{
 			return Simulator::Now();
 		}
 
 		uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
-		uint64_t nowUs = static_cast<uint64_t>(Simulator::Now().GetMicroSeconds());
-		uint64_t offsetUs = nowUs >= m_rnicGateEpochStartUs ?
-			(nowUs - m_rnicGateEpochStartUs) % m_rnicGatePeriodUs :
-			(m_rnicGatePeriodUs - ((m_rnicGateEpochStartUs - nowUs) % m_rnicGatePeriodUs)) % m_rnicGatePeriodUs;
+		uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+		uint64_t offsetNs = nowNs >= m_rnicGateEpochStartNs ?
+			(nowNs - m_rnicGateEpochStartNs) % m_rnicGatePeriodNs :
+			(m_rnicGatePeriodNs - ((m_rnicGateEpochStartNs - nowNs) % m_rnicGatePeriodNs)) % m_rnicGatePeriodNs;
 
-		uint64_t bestDeltaUs = UINT64_MAX;
+		uint64_t bestDeltaNs = UINT64_MAX;
 		for (uint32_t i = 0; i < m_rnicGateSlots.size(); ++i)
 		{
 			const RnicGateSlotEntry &slot = m_rnicGateSlots[i];
@@ -293,32 +293,33 @@ namespace ns3
 				continue;
 			}
 
-			uint64_t candidateDeltaUs;
-			if (offsetUs < slot.startOffsetUs)
+			uint64_t candidateDeltaNs;
+			if (offsetNs < slot.startOffsetNs)
 			{
-				candidateDeltaUs = slot.startOffsetUs - offsetUs;
+				candidateDeltaNs = slot.startOffsetNs - offsetNs;
 			}
-			else if (offsetUs >= slot.startOffsetUs && offsetUs < slot.endOffsetUs)
+			else if (offsetNs >= slot.startOffsetNs && offsetNs < slot.endOffsetNs)
 			{
-				candidateDeltaUs = 0;
+				candidateDeltaNs = 0;
 			}
 			else
 			{
-				candidateDeltaUs = m_rnicGatePeriodUs - offsetUs + slot.startOffsetUs;
+				candidateDeltaNs = m_rnicGatePeriodNs - offsetNs + slot.startOffsetNs;
 			}
 
-			if (candidateDeltaUs < bestDeltaUs)
+			if (candidateDeltaNs < bestDeltaNs)
 			{
-				bestDeltaUs = candidateDeltaUs;
+				bestDeltaNs = candidateDeltaNs;
 			}
 		}
 
-		if (bestDeltaUs == UINT64_MAX)
+		if (bestDeltaNs == UINT64_MAX)
 		{
 			return Simulator::GetMaximumSimulationTime();
 		}
-		return Simulator::Now() + MicroSeconds(bestDeltaUs);
+		return Simulator::Now() + NanoSeconds(bestDeltaNs);
 	}
+
 
 	uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp)
 	{

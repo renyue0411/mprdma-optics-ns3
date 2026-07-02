@@ -44,15 +44,15 @@ public:
 
 	struct RnicGateSlotEntry
 	{
-		uint64_t startOffsetUs;
-		uint64_t endOffsetUs;
+		uint64_t startOffsetNs;
+		uint64_t endOffsetNs;
 		std::vector<uint64_t> dstRnicBitmapWords;
 	};
 
 	bool m_rnicGateEnabled;
 	uint32_t m_rnicGateRnicId;
-	uint64_t m_rnicGateEpochStartUs;
-	uint64_t m_rnicGatePeriodUs;
+	uint64_t m_rnicGateEpochStartNs;
+	uint64_t m_rnicGatePeriodNs;
 	std::vector<RnicGateSlotEntry> m_rnicGateSlots;
 
 	// qp complete callback
@@ -61,7 +61,7 @@ public:
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb); // setup shared data and callbacks with the QbbNetDevice
-	void EnableRnicGate(uint32_t rnicId, uint64_t epochStartUs, uint64_t periodUs, const std::vector<RnicGateSlotEntry> &slots);
+	void EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots);
 	void DisableRnicGate();
 	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
 	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const;

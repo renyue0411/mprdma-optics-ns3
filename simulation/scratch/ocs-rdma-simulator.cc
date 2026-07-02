@@ -1042,6 +1042,9 @@ int main(int argc, char *argv[])
 
 	rdmaOcsController = CreateObject<RdmaOcsController>();
 	rdmaOcsController->SetNodeContainer(n);
+	// PACKET_PAYLOAD_SIZE excludes protocol headers. The RNIC gate deadline
+	// uses the approximate wire packet size observed by the OCS data path.
+	rdmaOcsController->SetRnicGatePacketBytes(packet_payload_size + 92);
 
 	for (std::set<uint32_t>::iterator it = ocs_node_ids.begin();
 		it != ocs_node_ids.end();
@@ -1220,8 +1223,15 @@ int main(int argc, char *argv[])
 		uint32_t dstIf = dstDev->GetIfIndex();
 
 		if (topology_has_logical_ports) {
-			rdmaOcsController->AddPortBinding(src, srcPort, srcIf, dst, dstPort);
-			rdmaOcsController->AddPortBinding(dst, dstPort, dstIf, src, srcPort);
+			uint64_t srcLinkDelayNs = DynamicCast<QbbChannel>(srcDev->GetChannel())->GetDelay().GetNanoSeconds();
+			uint64_t dstLinkDelayNs = DynamicCast<QbbChannel>(dstDev->GetChannel())->GetDelay().GetNanoSeconds();
+			uint64_t srcLinkBandwidthBps = srcDev->GetDataRate().GetBitRate();
+			uint64_t dstLinkBandwidthBps = dstDev->GetDataRate().GetBitRate();
+
+			rdmaOcsController->AddPortBinding(src, srcPort, srcIf, dst, dstPort,
+										srcLinkDelayNs, srcLinkBandwidthBps);
+			rdmaOcsController->AddPortBinding(dst, dstPort, dstIf, src, srcPort,
+										dstLinkDelayNs, dstLinkBandwidthBps);
 
 			std::cout << "[PORT MAP] node " << src
 					<< " logical " << srcPort

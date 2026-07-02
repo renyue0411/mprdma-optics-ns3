@@ -38,7 +38,12 @@ public:
                        uint32_t logicalPort,
                        uint32_t ifIndex,
                        uint32_t peerNodeId,
-                       uint32_t peerLogicalPort);
+                       uint32_t peerLogicalPort,
+                       uint64_t linkDelayNs,
+                       uint64_t linkBandwidthBps);
+
+  void SetRnicGatePacketBytes (uint32_t packetBytes);
+  void SetRnicGateAckBytes (uint32_t packetBytes);
 
   void LoadAndInstallOcsMap (const std::string &filename);
   void LoadAndInstallOcsSchedule (const std::string &filename);
@@ -58,6 +63,8 @@ private:
     uint32_t ifIndex;
     uint32_t peerNodeId;
     uint32_t peerLogicalPort;
+    uint64_t linkDelayNs;
+    uint64_t linkBandwidthBps;
   };
 
   struct OcsScheduleConfig
@@ -136,6 +143,9 @@ private:
   // For EPS_AGGREGATED: attachment node is EPS/ToR node.
   // For RNIC_DIRECT_OCS: attachment node is the RNIC node itself.
   std::map<uint32_t, uint32_t> m_attachmentNodeToRnicGroup;
+
+  uint32_t m_rnicGatePacketBytes;
+  uint32_t m_rnicGateAckBytes;
 
   std::vector<RnicReachabilityWindow> m_rnicReachabilityWindows;
 };
