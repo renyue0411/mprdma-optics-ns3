@@ -42,12 +42,29 @@ public:
 	std::unordered_map<uint64_t, Ptr<RdmaRxQueuePair> > m_rxQpMap; // mapping from uint64_t to rx qp
 	std::unordered_map<uint32_t, std::vector<int> > m_rtTable; // map from ip address (u32) to possible ECMP port (index of dev)
 
+	struct RnicGateSlotEntry
+	{
+		uint64_t startOffsetUs;
+		uint64_t endOffsetUs;
+		std::vector<uint64_t> dstRnicBitmapWords;
+	};
+
+	bool m_rnicGateEnabled;
+	uint32_t m_rnicGateRnicId;
+	uint64_t m_rnicGateEpochStartUs;
+	uint64_t m_rnicGatePeriodUs;
+	std::vector<RnicGateSlotEntry> m_rnicGateSlots;
+
 	// qp complete callback
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpCompleteCallback;
 	QpCompleteCallback m_qpCompleteCallback;
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb); // setup shared data and callbacks with the QbbNetDevice
+	void EnableRnicGate(uint32_t rnicId, uint64_t epochStartUs, uint64_t periodUs, const std::vector<RnicGateSlotEntry> &slots);
+	void DisableRnicGate();
+	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;
+	Time GetNextRnicGateTime(Ptr<RdmaQueuePair> qp) const;
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp

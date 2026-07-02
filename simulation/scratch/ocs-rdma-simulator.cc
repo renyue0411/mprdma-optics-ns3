@@ -44,7 +44,11 @@
 
 // OCS node
 #include "ns3/ocs-node.h"
+#include "ns3/rdma-ocs-controller.h"
 #include <set>
+#include <limits>
+#include <cstdlib>
+#include <algorithm>
 
 using namespace ns3;
 using namespace std;
@@ -71,15 +75,15 @@ std::string ocs_map_file = "";
 uint32_t ocs_schedule_enable = 0;
 std::string ocs_schedule_file = "";
 
-struct OcsScheduleConfig
-{
-    uint32_t epochStartUs;
-    uint32_t sliceDurationUs;
-    uint32_t switchingTimeUs;
-    uint32_t numSlices;
-};
+// Topology link format.
+//   auto: 3-field header uses legacy links; 4-field header auto-detects
+//         full with_ocs_ports vs compact_ocs_ports per link line.
+//   legacy: src dst rate delay error
+//   with_ocs_ports: src dst src_port dst_port rate delay error
+//   compact_ocs_ports: src dst [only OCS endpoint logical ports] rate delay error
+std::string topology_format = "auto";
 
-std::map<uint32_t, OcsScheduleConfig> ocsScheduleConfigs;
+Ptr<RdmaOcsController> rdmaOcsController;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -150,11 +154,6 @@ std::vector<Ipv4Address> serverAddress;
 // maintain port number for each host pair
 std::unordered_map<uint32_t, unordered_map<uint32_t, uint16_t>> portNumder;
 
-// OCS logical-port mappings.
-// The topology file exposes stable logical port IDs; ns-3 devices use ifIndex.
-std::map<uint32_t, std::map<uint32_t, uint32_t> > logicalPortToIf;
-std::map<uint32_t, std::map<uint32_t, uint32_t> > ifToLogicalPort;
-
 struct FlowInput
 {
 	uint32_t src, dst, pg, maxPacketCount, port, dport;
@@ -163,9 +162,6 @@ struct FlowInput
 };
 FlowInput flow_input = {0};
 uint32_t flow_num;
-
-void LoadOcsInitialMapping(NodeContainer &n);
-void LoadOcsSchedule(NodeContainer &n);
 
 void ReadFlowInput()
 {
@@ -424,6 +420,57 @@ uint64_t get_nic_rate(NodeContainer &n)
 	for (uint32_t i = 0; i < n.GetN(); i++)
 		if (n.Get(i)->GetNodeType() == 0)
 			return DynamicCast<QbbNetDevice>(n.Get(i)->GetDevice(1))->GetDataRate().GetBitRate();
+}
+
+
+static bool
+StartsWithCommentOrBlank(const std::string &line)
+{
+	for (size_t i = 0; i < line.size(); i++)
+	{
+		if (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')
+		{
+			continue;
+		}
+		return line[i] == '#';
+	}
+	return true;
+}
+
+static std::vector<std::string>
+TokenizeLine(const std::string &line)
+{
+	std::vector<std::string> tokens;
+	std::istringstream iss(line);
+	std::string token;
+	while (iss >> token)
+	{
+		if (!token.empty() && token[0] == '#')
+		{
+			break;
+		}
+		tokens.push_back(token);
+	}
+	return tokens;
+}
+
+static uint32_t
+ParseUint32Token(const std::string &token, const std::string &line)
+{
+	char *end = 0;
+	unsigned long value = std::strtoul(token.c_str(), &end, 10);
+	NS_ASSERT_MSG(end != token.c_str() && *end == '\0', "Invalid uint32 token '" << token << "' in topology line: " << line);
+	NS_ASSERT_MSG(value <= 0xfffffffful, "uint32 token out of range '" << token << "' in topology line: " << line);
+	return static_cast<uint32_t>(value);
+}
+
+static double
+ParseDoubleToken(const std::string &token, const std::string &line)
+{
+	char *end = 0;
+	double value = std::strtod(token.c_str(), &end);
+	NS_ASSERT_MSG(end != token.c_str() && *end == '\0', "Invalid double token '" << token << "' in topology line: " << line);
+	return value;
 }
 
 int main(int argc, char *argv[])
@@ -819,6 +866,11 @@ int main(int argc, char *argv[])
 				conf >> pint_prob;
 				std::cout << "PINT_PROB\t\t\t\t" << pint_prob << '\n';
 			}
+			else if (key.compare("TOPOLOGY_FORMAT") == 0)
+			{
+				conf >> topology_format;
+				std::cout << "TOPOLOGY_FORMAT_CONFIG\t\t" << topology_format << "\n";
+			}
 			else if (key.compare("OCS_MAP_FILE") == 0)
 			{
 				conf >> ocs_map_file;
@@ -903,18 +955,26 @@ int main(int argc, char *argv[])
 		node_num = headerFields[0];
 		switch_num = headerFields[1];
 		link_num = headerFields[2];
+		NS_ASSERT_MSG(topology_format == "auto" || topology_format == "legacy",
+				"3-field topology header only supports TOPOLOGY_FORMAT auto or legacy");
 		std::cout << "TOPOLOGY_FORMAT\t\t\tlegacy\n";
 	}
 	else if (headerFields.size() == 4) {
 		// OCS-aware format:
 		// node_num switch_num ocs_num link_num
-		// src dst src_port dst_port rate delay error
+		// Supported link formats:
+		//   with_ocs_ports:    src dst src_port dst_port rate delay error
+		//   compact_ocs_ports: src dst [only OCS endpoint logical ports] rate delay error
 		node_num = headerFields[0];
 		switch_num = headerFields[1];
 		ocs_num = headerFields[2];
 		link_num = headerFields[3];
 		topology_has_logical_ports = true;
-		std::cout << "TOPOLOGY_FORMAT\t\t\twith_ocs_ports\n";
+		NS_ASSERT_MSG(topology_format == "auto" || topology_format == "with_ocs_ports" || topology_format == "compact_ocs_ports",
+				"4-field topology header only supports TOPOLOGY_FORMAT auto, with_ocs_ports, or compact_ocs_ports");
+		std::cout << "TOPOLOGY_FORMAT\t\t\t"
+				  << (topology_format == "auto" ? "auto_ocs_ports" : topology_format)
+				  << "\n";
 	}
 	else {
 		NS_ASSERT_MSG(false, "Invalid topology header format");
@@ -950,6 +1010,15 @@ int main(int argc, char *argv[])
 		std::cout << "[TOPOLOGY OCS] node=" << oid << std::endl;
 	}
 
+	// Switch and OCS IDs are token-based. Move to the next line before
+	// parsing link entries line-by-line so compact_ocs_ports can have
+	// variable token counts per link. If there are no ID tokens, the stream
+	// is already positioned at the first link line.
+	if (switch_num + ocs_num > 0)
+	{
+		topof.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+	}
+
 	for (uint32_t i = 0; i < node_num; i++)
 	{
 		if (node_type[i] == 2)
@@ -969,6 +1038,16 @@ int main(int argc, char *argv[])
 		{
 			n.Add(CreateObject<Node>());
 		}
+	}
+
+	rdmaOcsController = CreateObject<RdmaOcsController>();
+	rdmaOcsController->SetNodeContainer(n);
+
+	for (std::set<uint32_t>::iterator it = ocs_node_ids.begin();
+		it != ocs_node_ids.end();
+		++it)
+	{
+		rdmaOcsController->AddOcsNode(*it);
 	}
 
 	NS_LOG_INFO("Create nodes.");
@@ -1011,26 +1090,98 @@ int main(int argc, char *argv[])
 	//
 	// set link attribute
 	//
+	std::vector<uint32_t> nextAutoLogicalPort(node_num, 0);
 	for (uint32_t i = 0; i < link_num; i++)
 	{
-		uint32_t src, dst;
+		uint32_t src = 0, dst = 0;
 		uint32_t srcPort = 0, dstPort = 0;
 		std::string data_rate, link_delay;
-		double error_rate;
+		double error_rate = 0.0;
 
-		if (topology_has_logical_ports) {
-			// OCS-aware format:
-			// src dst src_port dst_port rate delay error
-			topof >> src >> dst >> srcPort >> dstPort >> data_rate >> link_delay >> error_rate;
+		std::string linkLine;
+		std::vector<std::string> tokens;
+		while (std::getline(topof, linkLine))
+		{
+			if (StartsWithCommentOrBlank(linkLine))
+			{
+				continue;
+			}
+			tokens = TokenizeLine(linkLine);
+			if (!tokens.empty())
+			{
+				break;
+			}
 		}
-		else {
+		NS_ASSERT_MSG(!tokens.empty(), "Unexpected end of topology file while reading link " << i);
+		NS_ASSERT_MSG(tokens.size() >= 2, "Invalid topology link line: expected at least src and dst: " << linkLine);
+
+		src = ParseUint32Token(tokens[0], linkLine);
+		dst = ParseUint32Token(tokens[1], linkLine);
+		NS_ASSERT_MSG(src < node_num, "link src node id out of range in topology line: " << linkLine);
+		NS_ASSERT_MSG(dst < node_num, "link dst node id out of range in topology line: " << linkLine);
+
+		if (!topology_has_logical_ports) {
 			// Legacy format:
 			// src dst rate delay error
-			topof >> src >> dst >> data_rate >> link_delay >> error_rate;
+			NS_ASSERT_MSG(tokens.size() == 5,
+					"Invalid legacy topology link line: expected 5 tokens, got "
+					<< tokens.size() << ": " << linkLine);
+			srcPort = nextAutoLogicalPort[src]++;
+			dstPort = nextAutoLogicalPort[dst]++;
+			data_rate = tokens[2];
+			link_delay = tokens[3];
+			error_rate = ParseDoubleToken(tokens[4], linkLine);
 		}
+		else {
+			const bool srcIsOcs = (node_type[src] == 2);
+			const bool dstIsOcs = (node_type[dst] == 2);
+			const size_t compactTokens = 2 + (srcIsOcs ? 1 : 0) + (dstIsOcs ? 1 : 0) + 3;
+			const bool forceCompact = (topology_format == "compact_ocs_ports");
+			const bool forceFull = (topology_format == "with_ocs_ports");
+			const bool useCompact = forceCompact || (!forceFull && tokens.size() == compactTokens);
 
-		NS_ASSERT_MSG(src < node_num, "link src node id out of range");
-		NS_ASSERT_MSG(dst < node_num, "link dst node id out of range");
+			if (useCompact) {
+				NS_ASSERT_MSG(tokens.size() == compactTokens,
+						"Invalid compact_ocs_ports topology link line: expected "
+						<< compactTokens << " tokens, got " << tokens.size()
+						<< ": " << linkLine);
+				size_t idx = 2;
+				if (srcIsOcs) {
+					srcPort = ParseUint32Token(tokens[idx++], linkLine);
+				}
+				else {
+					srcPort = nextAutoLogicalPort[src]++;
+				}
+				if (dstIsOcs) {
+					dstPort = ParseUint32Token(tokens[idx++], linkLine);
+				}
+				else {
+					dstPort = nextAutoLogicalPort[dst]++;
+				}
+				data_rate = tokens[idx++];
+				link_delay = tokens[idx++];
+				error_rate = ParseDoubleToken(tokens[idx++], linkLine);
+			}
+			else {
+				// Full OCS-aware format:
+				// src dst src_port dst_port rate delay error
+				NS_ASSERT_MSG(tokens.size() == 7,
+						"Invalid with_ocs_ports topology link line: expected 7 tokens, got "
+						<< tokens.size() << ": " << linkLine);
+				srcPort = ParseUint32Token(tokens[2], linkLine);
+				dstPort = ParseUint32Token(tokens[3], linkLine);
+				data_rate = tokens[4];
+				link_delay = tokens[5];
+				error_rate = ParseDoubleToken(tokens[6], linkLine);
+
+				if (!srcIsOcs) {
+					nextAutoLogicalPort[src] = std::max(nextAutoLogicalPort[src], srcPort + 1);
+				}
+				if (!dstIsOcs) {
+					nextAutoLogicalPort[dst] = std::max(nextAutoLogicalPort[dst], dstPort + 1);
+				}
+			}
+		}
 
 		Ptr<Node> snode = n.Get(src), dnode = n.Get(dst);
 
@@ -1069,32 +1220,21 @@ int main(int argc, char *argv[])
 		uint32_t dstIf = dstDev->GetIfIndex();
 
 		if (topology_has_logical_ports) {
-			NS_ASSERT_MSG(
-				logicalPortToIf[src].find(srcPort) == logicalPortToIf[src].end(),
-				"Duplicate logical port on src node"
-			);
-			NS_ASSERT_MSG(
-				logicalPortToIf[dst].find(dstPort) == logicalPortToIf[dst].end(),
-				"Duplicate logical port on dst node"
-			);
-
-			logicalPortToIf[src][srcPort] = srcIf;
-			logicalPortToIf[dst][dstPort] = dstIf;
-			ifToLogicalPort[src][srcIf] = srcPort;
-			ifToLogicalPort[dst][dstIf] = dstPort;
+			rdmaOcsController->AddPortBinding(src, srcPort, srcIf, dst, dstPort);
+			rdmaOcsController->AddPortBinding(dst, dstPort, dstIf, src, srcPort);
 
 			std::cout << "[PORT MAP] node " << src
-			          << " logical " << srcPort
-			          << " -> if " << srcIf
-			          << " connected to node " << dst
-			          << " logical " << dstPort
-			          << std::endl;
+					<< " logical " << srcPort
+					<< " -> if " << srcIf
+					<< " connected to node " << dst
+					<< " logical " << dstPort
+					<< std::endl;
 			std::cout << "[PORT MAP] node " << dst
-			          << " logical " << dstPort
-			          << " -> if " << dstIf
-			          << " connected to node " << src
-			          << " logical " << srcPort
-			          << std::endl;
+					<< " logical " << dstPort
+					<< " -> if " << dstIf
+					<< " connected to node " << src
+					<< " logical " << srcPort
+					<< std::endl;
 		}
 
 		if (snode->GetNodeType() == 0)
@@ -1131,13 +1271,24 @@ int main(int argc, char *argv[])
 		dstDev->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback(&get_pfc, pfc_file, dstDev));
 	}
 
-	if (ocs_schedule_enable)
+	if (ocs_schedule_enable && !ocs_node_ids.empty())
 	{
-		LoadOcsSchedule(n);
+		rdmaOcsController->LoadAndInstallOcsSchedule(ocs_schedule_file);
+
+		rdmaOcsController->BuildRnicGroups();
+		rdmaOcsController->DumpRnicGroups();
+
+		rdmaOcsController->CompileRnicReachabilityWindows();
+		rdmaOcsController->DumpRnicReachabilityWindows();
+	}
+	else if (!ocs_node_ids.empty())
+	{
+		rdmaOcsController->LoadAndInstallOcsMap(ocs_map_file);
 	}
 	else
 	{
-		LoadOcsInitialMapping(n);
+		std::cout << "[OCS DISABLED] no OCS nodes; skip OCS controller"
+				<< std::endl;
 	}
 
 	nic_rate = get_nic_rate(n);
@@ -1223,6 +1374,11 @@ int main(int argc, char *argv[])
 		}
 	}
 #endif
+
+	if (ocs_schedule_enable && !ocs_node_ids.empty())
+	{
+		rdmaOcsController->InstallRnicGateTablesToRdmaHw();
+	}
 
 	// set ACK priority on hosts
 	if (ack_high_prio)
@@ -1373,335 +1529,3 @@ int main(int argc, char *argv[])
 	endt = clock();
 	std::cout << (double)(endt - begint) / CLOCKS_PER_SEC << "\n";
 }
-
-
-void LoadOcsInitialMapping(NodeContainer &n)
-{
-    if (ocs_map_file.empty()) {
-        return;
-    }
-
-    std::ifstream fin(ocs_map_file.c_str());
-    if (!fin.is_open()) {
-        std::cout << "Cannot open OCS_MAP_FILE: " << ocs_map_file << std::endl;
-        return;
-    }
-
-    std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t> > > ocsMappings;
-
-    std::string line;
-    uint32_t lineNo = 0;
-
-    while (std::getline(fin, line)) {
-        lineNo++;
-
-        // Remove inline comments.
-        size_t commentPos = line.find('#');
-        if (commentPos != std::string::npos) {
-            line = line.substr(0, commentPos);
-        }
-
-        std::stringstream ss(line);
-
-        uint32_t ocsId, logicalPortA, logicalPortB;
-
-        // Ignore empty and comment-only lines.
-        if (!(ss >> ocsId >> logicalPortA >> logicalPortB)) {
-            continue;
-        }
-
-        std::string extra;
-        if (ss >> extra) {
-            std::cout << "[WARN] Extra field in OCS_MAP_FILE at line "
-                      << lineNo << ": " << extra << std::endl;
-        }
-
-        NS_ASSERT_MSG(ocsId < n.GetN(), "OCS map points to invalid node id");
-
-        Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(ocsId));
-        NS_ASSERT_MSG(ocs != 0, "OCS_MAP_FILE points to a non-OCS node");
-
-        NS_ASSERT_MSG(
-            logicalPortToIf[ocsId].find(logicalPortA) != logicalPortToIf[ocsId].end(),
-            "OCS logical port A not found"
-        );
-
-        NS_ASSERT_MSG(
-            logicalPortToIf[ocsId].find(logicalPortB) != logicalPortToIf[ocsId].end(),
-            "OCS logical port B not found"
-        );
-
-        uint32_t actualIfA = logicalPortToIf[ocsId][logicalPortA];
-        uint32_t actualIfB = logicalPortToIf[ocsId][logicalPortB];
-
-        std::cout << "[LOAD OCS MAP] OCS " << ocsId
-                  << " logical " << logicalPortA
-                  << "(if " << actualIfA << ")"
-                  << " <-> "
-                  << "logical " << logicalPortB
-                  << "(if " << actualIfB << ")"
-                  << std::endl;
-
-        // One map line describes one bidirectional optical circuit.
-        ocsMappings[ocsId].push_back(std::make_pair(actualIfA, actualIfB));
-        ocsMappings[ocsId].push_back(std::make_pair(actualIfB, actualIfA));
-	}
-
-    for (std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t> > >::iterator it = ocsMappings.begin();
-         it != ocsMappings.end(); ++it) {
-        uint32_t id = it->first;
-
-        Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(id));
-        NS_ASSERT_MSG(ocs != 0, "OCS map points to a non-OCS node");
-
-        ocs->SetInitialMapping(it->second);
-    }
-
-    for (std::set<uint32_t>::iterator it = ocs_node_ids.begin();
-         it != ocs_node_ids.end(); ++it) {
-        if (ocsMappings.find(*it) == ocsMappings.end()) {
-            std::cout << "[WARN] OCS " << *it
-                      << " has no initial mapping"
-                      << std::endl;
-        }
-    }
-}
-
-void LoadOcsSchedule(NodeContainer &n)
-{
-    if (ocs_schedule_file.empty())
-    {
-        std::cout << "[OCS SCHEDULE] no schedule file configured" << std::endl;
-        return;
-    }
-
-    std::ifstream fin(ocs_schedule_file.c_str());
-    if (!fin.is_open())
-    {
-        std::cout << "Cannot open OCS_SCHEDULE_FILE: " << ocs_schedule_file << std::endl;
-        return;
-    }
-
-    typedef std::pair<uint32_t, uint32_t> PortPair;
-    typedef std::pair<uint32_t, PortPair> SliceCircuit;
-
-    // ocsId -> vector<(slice, (actualIfA, actualIfB))>
-    std::map<uint32_t, std::vector<SliceCircuit> > scheduleEntries;
-
-    // ocsId -> slice -> used logical ports
-    std::map<uint32_t, std::map<uint32_t, std::set<uint32_t> > > usedLogicalPorts;
-
-    ocsScheduleConfigs.clear();
-
-    std::string line;
-    uint32_t lineNo = 0;
-
-    while (std::getline(fin, line))
-    {
-        lineNo++;
-
-        // Remove inline comments.
-        size_t commentPos = line.find('#');
-        if (commentPos != std::string::npos)
-        {
-            line = line.substr(0, commentPos);
-        }
-
-        std::stringstream ss(line);
-        std::string first;
-
-        if (!(ss >> first))
-        {
-            continue; // empty line
-        }
-
-        if (first == "CONFIG" || first == "config")
-        {
-            uint32_t ocsId;
-            OcsScheduleConfig cfg;
-
-            if (!(ss >> ocsId
-                     >> cfg.epochStartUs
-                     >> cfg.sliceDurationUs
-                     >> cfg.switchingTimeUs
-                     >> cfg.numSlices))
-            {
-                NS_ASSERT_MSG(false,
-                              "Invalid OCS CONFIG line at line " << lineNo);
-            }
-
-            std::string extra;
-            if (ss >> extra)
-            {
-                std::cout << "[WARN] Extra field in OCS CONFIG at line "
-                          << lineNo << ": " << extra << std::endl;
-            }
-
-            NS_ASSERT_MSG(ocsId < n.GetN(), "OCS CONFIG points to invalid node id");
-            NS_ASSERT_MSG(ocs_node_ids.find(ocsId) != ocs_node_ids.end(),
-                          "OCS CONFIG points to a non-OCS node");
-            NS_ASSERT_MSG(cfg.numSlices > 0,
-                          "OCS CONFIG num_slices must be larger than 0");
-            NS_ASSERT_MSG(cfg.sliceDurationUs > 0,
-                          "OCS CONFIG slice_duration_us must be larger than 0");
-            NS_ASSERT_MSG(cfg.switchingTimeUs < cfg.sliceDurationUs,
-                          "OCS CONFIG switching_time_us must be smaller than slice_duration_us");
-
-            if (ocsScheduleConfigs.find(ocsId) != ocsScheduleConfigs.end())
-            {
-                NS_ASSERT_MSG(false,
-                              "Duplicate OCS CONFIG for node " << ocsId);
-            }
-
-            ocsScheduleConfigs[ocsId] = cfg;
-
-            std::cout << "[LOAD OCS CONFIG] OCS " << ocsId
-                      << " epoch_start_us=" << cfg.epochStartUs
-                      << " slice_duration_us=" << cfg.sliceDurationUs
-                      << " switching_time_us=" << cfg.switchingTimeUs
-                      << " num_slices=" << cfg.numSlices
-                      << std::endl;
-
-            continue;
-        }
-
-        // Otherwise, parse a normal schedule entry:
-        // ocs_id slice logical_port_a logical_port_b
-        std::stringstream lineSs(line);
-
-        uint32_t ocsId;
-        uint32_t slice;
-        uint32_t logicalPortA;
-        uint32_t logicalPortB;
-
-        if (!(lineSs >> ocsId >> slice >> logicalPortA >> logicalPortB))
-        {
-            NS_ASSERT_MSG(false,
-                          "Invalid OCS schedule line at line " << lineNo);
-        }
-
-        std::string extra;
-        if (lineSs >> extra)
-        {
-            std::cout << "[WARN] Extra field in OCS_SCHEDULE_FILE at line "
-                      << lineNo << ": " << extra << std::endl;
-        }
-
-        NS_ASSERT_MSG(ocsId < n.GetN(), "OCS schedule points to invalid node id");
-
-        Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(ocsId));
-        NS_ASSERT_MSG(ocs != 0, "OCS_SCHEDULE_FILE points to a non-OCS node");
-
-        NS_ASSERT_MSG(
-            logicalPortToIf[ocsId].find(logicalPortA) != logicalPortToIf[ocsId].end(),
-            "OCS schedule logical port A not found"
-        );
-
-        NS_ASSERT_MSG(
-            logicalPortToIf[ocsId].find(logicalPortB) != logicalPortToIf[ocsId].end(),
-            "OCS schedule logical port B not found"
-        );
-
-        NS_ASSERT_MSG(logicalPortA != logicalPortB,
-                      "OCS schedule cannot connect a port to itself");
-
-        // Check one OCS port is used at most once in one slice.
-        NS_ASSERT_MSG(
-            usedLogicalPorts[ocsId][slice].find(logicalPortA) ==
-                usedLogicalPorts[ocsId][slice].end(),
-            "OCS schedule reuses logical port A in the same slice"
-        );
-
-        NS_ASSERT_MSG(
-            usedLogicalPorts[ocsId][slice].find(logicalPortB) ==
-                usedLogicalPorts[ocsId][slice].end(),
-            "OCS schedule reuses logical port B in the same slice"
-        );
-
-        usedLogicalPorts[ocsId][slice].insert(logicalPortA);
-        usedLogicalPorts[ocsId][slice].insert(logicalPortB);
-
-        uint32_t actualIfA = logicalPortToIf[ocsId][logicalPortA];
-        uint32_t actualIfB = logicalPortToIf[ocsId][logicalPortB];
-
-        std::cout << "[LOAD OCS SCHEDULE] OCS " << ocsId
-                  << " slice " << slice
-                  << " logical " << logicalPortA
-                  << "(if " << actualIfA << ")"
-                  << " <-> "
-                  << "logical " << logicalPortB
-                  << "(if " << actualIfB << ")"
-                  << std::endl;
-
-        scheduleEntries[ocsId].push_back(
-            std::make_pair(slice, std::make_pair(actualIfA, actualIfB))
-        );
-    }
-
-    fin.close();
-
-    // Install schedules.
-    for (std::map<uint32_t, std::vector<SliceCircuit> >::iterator it = scheduleEntries.begin();
-         it != scheduleEntries.end(); ++it)
-    {
-        uint32_t id = it->first;
-
-        Ptr<OcsNode> ocs = DynamicCast<OcsNode>(n.Get(id));
-        NS_ASSERT_MSG(ocs != 0, "OCS schedule points to a non-OCS node");
-
-        std::map<uint32_t, OcsScheduleConfig>::iterator cfgIt =
-            ocsScheduleConfigs.find(id);
-
-        NS_ASSERT_MSG(cfgIt != ocsScheduleConfigs.end(),
-                      "Missing CONFIG line for scheduled OCS node");
-
-        OcsScheduleConfig cfg = cfgIt->second;
-
-        ocs->ConfigureSchedule(MicroSeconds(cfg.epochStartUs),
-                               MicroSeconds(cfg.sliceDurationUs),
-                               cfg.numSlices,
-                               MicroSeconds(cfg.switchingTimeUs));
-
-        ocs->ClearSchedule();
-
-        for (uint32_t i = 0; i < it->second.size(); ++i)
-        {
-            uint32_t slice = it->second[i].first;
-            uint32_t actualIfA = it->second[i].second.first;
-            uint32_t actualIfB = it->second[i].second.second;
-
-            NS_ASSERT_MSG(slice < cfg.numSlices,
-                          "OCS schedule slice index exceeds num_slices");
-
-            ocs->AddBidirectionalScheduleEntry(actualIfA, actualIfB, slice);
-        }
-
-        std::cout << "[OCS SCHEDULE INSTALLED] node=" << id
-                  << " entries=" << it->second.size()
-                  << " epoch_start_us=" << cfg.epochStartUs
-                  << " num_slices=" << cfg.numSlices
-                  << " slice_duration_us=" << cfg.sliceDurationUs
-                  << " switching_time_us=" << cfg.switchingTimeUs
-                  << std::endl;
-    }
-
-    // Warn about OCS nodes that have no schedule entries.
-    for (std::set<uint32_t>::iterator it = ocs_node_ids.begin();
-         it != ocs_node_ids.end(); ++it)
-    {
-        if (scheduleEntries.find(*it) == scheduleEntries.end())
-        {
-            std::cout << "[WARN] OCS " << *it
-                      << " has no schedule entries"
-                      << std::endl;
-        }
-
-        if (ocsScheduleConfigs.find(*it) == ocsScheduleConfigs.end())
-        {
-            std::cout << "[WARN] OCS " << *it
-                      << " has no CONFIG line"
-                      << std::endl;
-        }
-    }
-}
-

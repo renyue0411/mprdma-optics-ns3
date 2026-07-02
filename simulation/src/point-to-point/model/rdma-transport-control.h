@@ -6,12 +6,16 @@
 #include "ns3/ptr.h"
 #include "ns3/drop-tail-queue.h"
 #include "ns3/rdma-queue-pair.h"
+#include "ns3/nstime.h"
+#include "ns3/callback.h"
 
 namespace ns3 {
 
 class RdmaTransportControl
 {
 public:
+  typedef Callback<bool, Ptr<RdmaQueuePair> > QpGateAllowCallback;
+  typedef Callback<Time, Ptr<RdmaQueuePair> > QpGateNextTimeCallback;
   /*
    * Return value follows RdmaEgressQueue convention:
    *   -1    : ACK / high-priority control queue
@@ -22,7 +26,10 @@ public:
                            Ptr<DropTailQueue> ackQ,
                            const bool paused[],
                            uint32_t ackQIdx,
-                           uint32_t rrLast);
+                           uint32_t rrLast,
+                           QpGateAllowCallback gateAllowCb,
+                           QpGateNextTimeCallback gateNextTimeCb,
+                           Time *nextGateWake);
 };
 
 } // namespace ns3

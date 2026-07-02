@@ -11,7 +11,10 @@ RdmaTransportControl::GetNextQindex(Ptr<RdmaQueuePairGroup> qpGrp,
                                     Ptr<DropTailQueue> ackQ,
                                     const bool paused[],
                                     uint32_t ackQIdx,
-                                    uint32_t rrLast)
+                                    uint32_t rrLast,
+                                    RdmaTransportControl::QpGateAllowCallback gateAllowCb,
+                                    RdmaTransportControl::QpGateNextTimeCallback gateNextTimeCb,
+                                    Time *nextGateWake)
 {
   if (!paused[ackQIdx] && ackQ->GetNPackets() > 0)
     {
@@ -36,6 +39,19 @@ RdmaTransportControl::GetNextQindex(Ptr<RdmaQueuePairGroup> qpGrp,
           if (qp->m_nextAvail.GetTimeStep() >
               Simulator::Now().GetTimeStep())
             {
+              continue;
+            }
+
+          if (!gateAllowCb.IsNull () && !gateAllowCb (qp))
+            {
+              if (!gateNextTimeCb.IsNull () && nextGateWake != 0)
+                {
+                  Time t = gateNextTimeCb (qp);
+                  if (t > Simulator::Now () && t < *nextGateWake)
+                    {
+                      *nextGateWake = t;
+                    }
+                }
               continue;
             }
 
