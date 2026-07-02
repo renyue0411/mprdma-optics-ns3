@@ -749,6 +749,8 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
   struct VertexInfo
   {
     bool isOcsPort;
+    bool isPacketSwitch;
+    uint32_t nodeId;
     uint32_t ocsId;
     uint32_t logicalPort;
   };
@@ -758,6 +760,7 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
     uint32_t a;
     uint32_t b;
     uint64_t delayNs;
+    uint64_t bandwidthBps;
   };
 
   uint32_t nextVertex = 0;
@@ -786,6 +789,8 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
 
       VertexInfo info;
       info.isOcsPort = false;
+      info.isPacketSwitch = true;
+      info.nodeId = nodeId;
       info.ocsId = std::numeric_limits<uint32_t>::max ();
       info.logicalPort = std::numeric_limits<uint32_t>::max ();
       vertexInfo.push_back (info);
@@ -819,6 +824,8 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
 
           VertexInfo info;
           info.isOcsPort = true;
+          info.isPacketSwitch = false;
+          info.nodeId = nodeId;
           info.ocsId = nodeId;
           info.logicalPort = logicalPort;
           vertexInfo.push_back (info);
@@ -964,6 +971,7 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
               edge.a = vA;
               edge.b = vB;
               edge.delayNs = binding.linkDelayNs;
+              edge.bandwidthBps = binding.linkBandwidthBps;
               staticEdges.push_back (edge);
             }
         }
@@ -1112,6 +1120,30 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
 
   const uint64_t infinity = std::numeric_limits<uint64_t>::max () / 4;
 
+  auto GetDirectedStaticEdgeWeightNs =
+    [&] (uint32_t fromVertex,
+         uint64_t delayNs,
+         uint64_t bandwidthBps,
+         uint32_t packetBytes) -> uint64_t
+    {
+      uint64_t weightNs = delayNs;
+
+      /*
+       * OCS vertices model transparent optical forwarding.  Therefore,
+       * leaving an OCS port only contributes the outgoing channel
+       * propagation delay.  Packet-switch vertices, such as EPS/ToR
+       * switches, must additionally serialize the packet on their
+       * selected egress link.  Source/destination RNIC serialization is
+       * accounted for separately by the endpoint offset helpers.
+       */
+      if (vertexInfo[fromVertex].isPacketSwitch)
+        {
+          weightNs += CalcSerializationNs (packetBytes, bandwidthBps);
+        }
+
+      return weightNs;
+    };
+
   for (uint32_t bi = 0; bi + 1 < boundaries.size (); ++bi)
     {
       uint64_t intervalStartNs = boundaries[bi];
@@ -1123,14 +1155,35 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
         }
 
       SimpleDsu dsu (nextVertex);
-      std::vector<std::vector<std::pair<uint32_t, uint64_t> > > adj (nextVertex);
+      std::vector<std::vector<std::pair<uint32_t, uint64_t> > > dataAdj (nextVertex);
+      std::vector<std::vector<std::pair<uint32_t, uint64_t> > > ackAdj (nextVertex);
 
       for (uint32_t i = 0; i < staticEdges.size (); ++i)
         {
           const WeightedEdge &edge = staticEdges[i];
           dsu.Unite (edge.a, edge.b);
-          adj[edge.a].push_back (std::make_pair (edge.b, edge.delayNs));
-          adj[edge.b].push_back (std::make_pair (edge.a, edge.delayNs));
+
+          uint64_t dataAB =
+            GetDirectedStaticEdgeWeightNs (edge.a, edge.delayNs,
+                                           edge.bandwidthBps,
+                                           m_rnicGatePacketBytes);
+          uint64_t dataBA =
+            GetDirectedStaticEdgeWeightNs (edge.b, edge.delayNs,
+                                           edge.bandwidthBps,
+                                           m_rnicGatePacketBytes);
+          uint64_t ackAB =
+            GetDirectedStaticEdgeWeightNs (edge.a, edge.delayNs,
+                                           edge.bandwidthBps,
+                                           m_rnicGateAckBytes);
+          uint64_t ackBA =
+            GetDirectedStaticEdgeWeightNs (edge.b, edge.delayNs,
+                                           edge.bandwidthBps,
+                                           m_rnicGateAckBytes);
+
+          dataAdj[edge.a].push_back (std::make_pair (edge.b, dataAB));
+          dataAdj[edge.b].push_back (std::make_pair (edge.a, dataBA));
+          ackAdj[edge.a].push_back (std::make_pair (edge.b, ackAB));
+          ackAdj[edge.b].push_back (std::make_pair (edge.a, ackBA));
         }
 
       for (uint32_t i = 0; i < m_ocsScheduleEntries.size (); ++i)
@@ -1187,8 +1240,10 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
                          "OCS schedule port B has no graph vertex");
 
           dsu.Unite (itA->second, itB->second);
-          adj[itA->second].push_back (std::make_pair (itB->second, 0));
-          adj[itB->second].push_back (std::make_pair (itA->second, 0));
+          dataAdj[itA->second].push_back (std::make_pair (itB->second, 0));
+          dataAdj[itB->second].push_back (std::make_pair (itA->second, 0));
+          ackAdj[itA->second].push_back (std::make_pair (itB->second, 0));
+          ackAdj[itB->second].push_back (std::make_pair (itA->second, 0));
         }
 
       for (std::map<uint32_t, uint32_t>::const_iterator srcIt =
@@ -1231,10 +1286,10 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
                   continue;
                 }
 
-              for (uint32_t ei = 0; ei < adj[v].size (); ++ei)
+              for (uint32_t ei = 0; ei < dataAdj[v].size (); ++ei)
                 {
-                  uint32_t to = adj[v][ei].first;
-                  uint64_t w = adj[v][ei].second;
+                  uint32_t to = dataAdj[v][ei].first;
+                  uint64_t w = dataAdj[v][ei].second;
                   if (dist[to] > d + w)
                     {
                       dist[to] = d + w;
@@ -1323,6 +1378,10 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
                * reach each OCS on the reverse path before the circuit becomes
                * invalid.  The ACK itself is not separately gated here; instead
                * the sender-side data injection deadline is pulled earlier.
+               *
+               * The reverse path uses ACK-sized directed edge weights.  Packet
+               * switches contribute egress serialization, while OCS ports remain
+               * transparent and contribute only channel propagation.
                */
               uint64_t dstDataDeliveryExtraNs =
                 GetEndpointDataDeliveryExtraNs (dstGroupObj);
@@ -1353,10 +1412,10 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
                       continue;
                     }
 
-                  for (uint32_t ei = 0; ei < adj[v].size (); ++ei)
+                  for (uint32_t ei = 0; ei < ackAdj[v].size (); ++ei)
                     {
-                      uint32_t to = adj[v][ei].first;
-                      uint64_t w = adj[v][ei].second;
+                      uint32_t to = ackAdj[v][ei].first;
+                      uint64_t w = ackAdj[v][ei].second;
                       if (reverseDist[to] > d + w)
                         {
                           reverseDist[to] = d + w;
@@ -1580,7 +1639,7 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
           entries = tableIt->second.size ();
         }
 
-      std::cout << "[RNIC QP ACK-SAFE INJECTION TABLE BEGIN] rnic=" << rnic
+      std::cout << "[RNIC QP EPS-AWARE ACK-SAFE INJECTION TABLE BEGIN] rnic=" << rnic
                 << " epochNs=0";
 
       if (periodNs > 0)
@@ -1647,7 +1706,7 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
             }
         }
 
-      std::cout << "[RNIC QP ACK-SAFE INJECTION TABLE END] rnic=" << rnic
+      std::cout << "[RNIC QP EPS-AWARE ACK-SAFE INJECTION TABLE END] rnic=" << rnic
                 << std::endl;
     }
 }
