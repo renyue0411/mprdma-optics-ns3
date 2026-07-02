@@ -2,6 +2,7 @@
 #include <ns3/seq-ts-header.h>
 #include <ns3/udp-header.h>
 #include <ns3/ipv4-header.h>
+#include <ns3/ipv4.h>
 #include "ns3/ppp-header.h"
 #include "ns3/boolean.h"
 #include "ns3/uinteger.h"
@@ -497,6 +498,39 @@ namespace ns3
 
 	int RdmaHw::Receive(Ptr<Packet> p, CustomHeader &ch)
 	{
+		// A host NIC must only process packets whose IP destination is one of
+		// its own local interface addresses. Without this check, a packet
+		// misdelivered by an OCS circuit can be accepted by the wrong host,
+		// which may create a false RxQP and generate an ACK for a flow that did
+		// not actually reach its destination.
+		bool dstIsLocal = false;
+		Ptr<Ipv4> ipv4 = m_node->GetObject<Ipv4>();
+		if (ipv4)
+		{
+			Ipv4Address dst(ch.dip);
+			for (uint32_t i = 0; i < ipv4->GetNInterfaces() && !dstIsLocal; ++i)
+			{
+				for (uint32_t j = 0; j < ipv4->GetNAddresses(i); ++j)
+				{
+					if (ipv4->GetAddress(i, j).GetLocal() == dst)
+					{
+						dstIsLocal = true;
+						break;
+					}
+				}
+			}
+		}
+		if (!dstIsLocal)
+		{
+			std::cout << "[RDMA DROP WRONG_DST] t=" << Simulator::Now().GetTimeStep()
+					  << " node=" << m_node->GetId()
+					  << " sip=" << Ipv4Address(ch.sip)
+					  << " dip=" << Ipv4Address(ch.dip)
+					  << " l3Prot=0x" << std::hex << (uint32_t)ch.l3Prot << std::dec
+					  << std::endl;
+			return 0;
+		}
+
 		if (ch.l3Prot == 0x11)
 		{ // UDP
 			ReceiveUdp(p, ch);
