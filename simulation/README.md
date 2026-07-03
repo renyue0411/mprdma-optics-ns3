@@ -294,7 +294,7 @@ python3 scripts/run_dashboard_experiment.py --name exp_1
 ```
 
 ## Dashboard
-![OCS/RDMA dashboard overview](/dashboard/assets/dashboard-overview.png)
+![OCS/RDMA dashboard overview](dashboard/assets/dashboard-overview.png)
 
 This repository includes a lightweight web dashboard for visualizing OCS/RDMA experiments.
 
