@@ -1719,7 +1719,7 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
           entries = tableIt->second.size ();
         }
 
-      std::cout << "[RNIC QP EPS-AWARE ACK-SAFE INJECTION TABLE BEGIN] rnic=" << rnic
+      std::cout << "[RNIC QP INJECTION TABLE BEGIN] rnic=" << rnic
                 << " epochNs=0";
 
       if (periodNs > 0)
@@ -1786,7 +1786,7 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
             }
         }
 
-      std::cout << "[RNIC QP EPS-AWARE ACK-SAFE INJECTION TABLE END] rnic=" << rnic
+      std::cout << "[RNIC QP INJECTION TABLE END] rnic=" << rnic
                 << std::endl;
     }
 }
