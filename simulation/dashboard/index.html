@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RDMA Support for Reconfigurable Optical Network</title>
+  <link rel="icon" type="image/png" href="assets/logo.png" />
+  <link rel="shortcut icon" type="image/png" href="assets/logo.png" />
+  <link rel="apple-touch-icon" href="assets/logo.png" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img class="brand-logo" src="assets/logo.png" alt="Dashboard logo" />
+        <div>
+          <h1>Dashboard</h1>
+        </div>
+      </div>
+      <div class="sidebar-section">
+        <label for="experimentSearch"></label>
+        <input id="experimentSearch" type="search" placeholder="Search" />
+      </div>
+      <div id="experimentList" class="experiment-list"></div>
+    </aside>
+
+    <main class="content">
+      <section class="header-card">
+        <div>
+          <h2 id="experimentTitle">No experiment loaded</h2>
+          <p id="experimentMeta" class="muted"></p>
+        </div>
+        <div id="summaryBadges" class="badges"></div>
+      </section>
+
+      <section class="grid">
+        <div class="card">
+          <div class="card-header">
+            <h3>Topology by Time Window</h3>
+          </div>
+          <div id="sliceTopology" class="slice-grid"></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header row-between">
+          <div>
+            <h3>Per-flow Throughput Timeline</h3>
+          </div>
+          <div class="chart-controls">
+            <label><input id="normalizeTime" type="checkbox" checked /> Normalize time</label>
+          </div>
+        </div>
+        <div id="throughputChart" class="chart"></div>
+        <div id="throughputLegend" class="legend"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h3>Flow Results</h3>
+        </div>
+        <div id="flowResultTable" class="table-wrap wide-table"></div>
+      </section>
+
+      <section class="grid stats-windows-grid">
+        <div class="card">
+          <div class="card-header"><h3>OCS Stats</h3></div>
+          <div id="ocsStatsTable" class="table-wrap"></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h3>RDMA Injection Table</h3></div>
+          <div id="injectionTable" class="table-wrap"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

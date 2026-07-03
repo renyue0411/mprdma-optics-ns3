@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import mimetypes
+import re
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse
+from typing import Optional
+
+CC_NAMES = {
+    1: "DCQCN",
+    3: "HPCC",
+    7: "TIMELY",
+    8: "DCTCP",
+    10: "HPCC-PINT",
+}
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SIM_DIR_DEFAULT = SCRIPT_DIR.parent
+
+
+@dataclass
+class Link:
+    src: int
+    dst: int
+    src_port: Optional[int]
+    dst_port: Optional[int]
+    rate: str
+    delay: str
+    error: str
+
+
+@dataclass
+class Flow:
+    index: int
+    src: int
+    dst: int
+    pg: int
+    dport: int
+    size_bytes: int
+    start_s: float
+    start_ns: int
+
+
+@dataclass
+class FctRecord:
+    index: int
+    src: int
+    dst: int
+    sport: int
+    dport: int
+    size_bytes: int
+    start_ns: int
+    fct_ns: int
+    standalone_delay_ns: int
+    finish_ns: int
+    avg_throughput_gbps: float
+
+
+def read_lines(path: Path):
+    if not path.exists():
+        return []
+    out = []
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+def safe_int(s, default=None):
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+
+def parse_config(path: Path):
+    cfg = {}
+    for line in read_lines(path):
+        parts = line.split()
+        if len(parts) >= 2:
+            cfg[parts[0]] = parts[1]
+
+    cc_code = safe_int(cfg.get("CC_MODE"), None)
+    schedule_enable = safe_int(cfg.get("OCS_SCHEDULE_ENABLE"), None)
+
+    return {
+        "raw": cfg,
+        "ccMode": cc_code,
+        "ccName": CC_NAMES.get(cc_code, f"UNKNOWN({cc_code})" if cc_code is not None else "-"),
+        "ocsMode": "schedule" if schedule_enable == 1 else ("map" if schedule_enable == 0 else "-"),
+    }
+
+
+def parse_topology(path: Path):
+    lines = read_lines(path)
+    if len(lines) < 3:
+        return {
+            "nodes": [],
+            "links": [],
+            "switches": [],
+            "ocs": [],
+            "rnics": [],
+            "totalNodes": 0,
+            "switchCount": 0,
+            "ocsCount": 0,
+        }
+
+    first = lines[0].split()
+    total_nodes = int(first[0])
+    switch_count = int(first[1])
+    ocs_count = int(first[2])
+    link_count = int(first[3])
+
+    switches = [int(x) for x in lines[1].split()] if switch_count else []
+    ocs_nodes = [int(x) for x in lines[2].split()] if ocs_count else []
+
+    switch_set = set(switches)
+    ocs_set = set(ocs_nodes)
+
+    nodes = []
+    for nid in range(total_nodes):
+        if nid in ocs_set:
+            ntype = "ocs"
+        elif nid in switch_set:
+            ntype = "eps"
+        else:
+            ntype = "rnic"
+        nodes.append({"id": nid, "type": ntype})
+
+    links = []
+    port_to_neighbor = {}
+
+    for line in lines[3:3 + link_count]:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+
+        src = int(parts[0])
+        dst = int(parts[1])
+        src_port = None
+        dst_port = None
+
+        if src in ocs_set and dst in ocs_set:
+            src_port = int(parts[2])
+            dst_port = int(parts[3])
+            rate, delay, err = parts[4], parts[5], parts[6]
+        elif src in ocs_set:
+            src_port = int(parts[2])
+            rate, delay, err = parts[3], parts[4], parts[5]
+        elif dst in ocs_set:
+            dst_port = int(parts[2])
+            rate, delay, err = parts[3], parts[4], parts[5]
+        else:
+            rate, delay, err = parts[2], parts[3], parts[4]
+
+        link = Link(src, dst, src_port, dst_port, rate, delay, err)
+        links.append(asdict(link))
+
+        if src in ocs_set and src_port is not None:
+            port_to_neighbor[f"{src}:{src_port}"] = {
+                "node": dst,
+                "peer_port": dst_port if dst_port is not None else 0,
+            }
+
+        if dst in ocs_set and dst_port is not None:
+            port_to_neighbor[f"{dst}:{dst_port}"] = {
+                "node": src,
+                "peer_port": src_port if src_port is not None else 0,
+            }
+
+    return {
+        "totalNodes": total_nodes,
+        "switchCount": switch_count,
+        "ocsCount": ocs_count,
+        "linkCount": link_count,
+        "switches": switches,
+        "ocs": ocs_nodes,
+        "rnics": [n["id"] for n in nodes if n["type"] == "rnic"],
+        "nodes": nodes,
+        "links": links,
+        "ocsPortToNeighbor": port_to_neighbor,
+    }
+
+
+def parse_schedule(path: Path):
+    configs = {}
+    entries = []
+
+    for line in read_lines(path):
+        parts = line.split()
+        if not parts:
+            continue
+
+        if parts[0] == "CONFIG" and len(parts) >= 6:
+            ocs = int(parts[1])
+            epoch_us = int(parts[2])
+            slice_us = int(parts[3])
+            switching_us = int(parts[4])
+            num_slices = int(parts[5])
+
+            configs[ocs] = {
+                "ocs": ocs,
+                "epochStartUs": epoch_us,
+                "epochStartNs": epoch_us * 1000,
+                "sliceDurationUs": slice_us,
+                "sliceDurationNs": slice_us * 1000,
+                "switchingTimeUs": switching_us,
+                "switchingTimeNs": switching_us * 1000,
+                "numSlices": num_slices,
+                "periodUs": slice_us * num_slices,
+                "periodNs": slice_us * num_slices * 1000,
+            }
+
+        elif len(parts) >= 4:
+            try:
+                entries.append({
+                    "ocs": int(parts[0]),
+                    "slice": int(parts[1]),
+                    "a": int(parts[2]),
+                    "b": int(parts[3]),
+                })
+            except Exception:
+                pass
+
+    return {
+        "configs": list(configs.values()),
+        "entries": entries,
+    }
+
+def parse_ocs_map(path: Path):
+    entries = []
+
+    for line in read_lines(path):
+        parts = line.split()
+
+        if len(parts) < 3:
+            continue
+
+        try:
+            ocs = int(parts[0])
+            a = int(parts[1])
+            b = int(parts[2])
+        except Exception:
+            continue
+
+        entries.append({
+            "ocs": ocs,
+            "slice": 0,
+            "a": a,
+            "b": b,
+        })
+
+    return entries
+
+
+def parse_flows(path: Path):
+    lines = read_lines(path)
+    if not lines:
+        return []
+
+    flow_count = None
+    start_idx = 0
+
+    first = lines[0].split()
+    if len(first) == 1 and safe_int(first[0]) is not None:
+        flow_count = int(first[0])
+        start_idx = 1
+
+    flows = []
+
+    for line in lines[start_idx:]:
+        if flow_count is not None and len(flows) >= flow_count:
+            break
+
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+
+        try:
+            src = int(parts[0])
+            dst = int(parts[1])
+            pg = int(parts[2])
+            dport = int(parts[3])
+            size = int(parts[4])
+            start_s = float(parts[5])
+        except Exception:
+            continue
+
+        flows.append(Flow(
+            index=len(flows),
+            src=src,
+            dst=dst,
+            pg=pg,
+            dport=dport,
+            size_bytes=size,
+            start_s=start_s,
+            start_ns=int(round(start_s * 1_000_000_000)),
+        ))
+
+    return flows
+
+
+def decode_fct_endpoint(token: str):
+    token = token.strip()
+
+    if token.startswith("0b") and len(token) >= 8:
+        return int(token[2:6], 16)
+
+    if token.startswith("0x"):
+        val = int(token, 16)
+        return (val >> 8) & 0xFFFF
+
+    return int(token)
+
+
+def parse_fct(path: Path):
+    records = []
+
+    for line in read_lines(path):
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+
+        try:
+            src = decode_fct_endpoint(parts[0])
+            dst = decode_fct_endpoint(parts[1])
+            sport = int(parts[2])
+            dport = int(parts[3])
+            size = int(parts[4])
+            start_ns = int(parts[5])
+            fct_ns = int(parts[6])
+            standalone = int(parts[7])
+        except Exception:
+            continue
+
+        finish_ns = start_ns + fct_ns
+        avg = 0.0 if fct_ns <= 0 else (size * 8.0) / fct_ns
+
+        records.append(FctRecord(
+            index=len(records),
+            src=src,
+            dst=dst,
+            sport=sport,
+            dport=dport,
+            size_bytes=size,
+            start_ns=start_ns,
+            fct_ns=fct_ns,
+            standalone_delay_ns=standalone,
+            finish_ns=finish_ns,
+            avg_throughput_gbps=avg,
+        ))
+
+    return records
+
+
+def filter_fct_by_flows(fct_records, flows):
+    remaining = {}
+
+    for f in flows:
+        key = (f.src, f.dst, f.dport, f.size_bytes, f.start_ns)
+        remaining[key] = remaining.get(key, 0) + 1
+
+    out = []
+
+    for r in fct_records:
+        key = (r.src, r.dst, r.dport, r.size_bytes, r.start_ns)
+
+        if remaining.get(key, 0) > 0:
+            rr = asdict(r)
+            rr["index"] = len(out)
+            out.append(rr)
+            remaining[key] -= 1
+
+    return out
+
+def join_flow_fct_results(fct_records, flows):
+    used = set()
+    rows = []
+
+    for f in flows:
+        best_idx = None
+        best_delta = None
+
+        for i, r in enumerate(fct_records):
+            if i in used:
+                continue
+
+            if r.src != f.src:
+                continue
+            if r.dst != f.dst:
+                continue
+            if r.dport != f.dport:
+                continue
+            if r.size_bytes != f.size_bytes:
+                continue
+
+            delta = abs(r.start_ns - f.start_ns)
+
+            # flow start 间隔通常是 20us，这里只允许 1us 以内的时间误差，避免错误匹配相邻 flow。
+            if delta <= 1000:
+                if best_delta is None or delta < best_delta:
+                    best_idx = i
+                    best_delta = delta
+
+        if best_idx is not None:
+            used.add(best_idx)
+            r = fct_records[best_idx]
+
+            rows.append({
+                "index": f.index,
+                "src": f.src,
+                "dst": f.dst,
+                "pg": f.pg,
+                "dport": f.dport,
+                "size_bytes": f.size_bytes,
+                "start_ns": f.start_ns,
+                "status": "completed",
+                "fct_ns": r.fct_ns,
+                "finish_ns": r.finish_ns,
+                "avg_throughput_gbps": r.avg_throughput_gbps,
+                "standalone_delay_ns": r.standalone_delay_ns,
+                "fct_index": r.index,
+                "fct_start_ns": r.start_ns,
+                "match_delta_ns": abs(r.start_ns - f.start_ns),
+            })
+        else:
+            rows.append({
+                "index": f.index,
+                "src": f.src,
+                "dst": f.dst,
+                "pg": f.pg,
+                "dport": f.dport,
+                "size_bytes": f.size_bytes,
+                "start_ns": f.start_ns,
+                "status": "missing",
+                "fct_ns": None,
+                "finish_ns": None,
+                "avg_throughput_gbps": None,
+                "standalone_delay_ns": None,
+                "fct_index": None,
+                "fct_start_ns": None,
+                "match_delta_ns": None,
+            })
+
+    return rows
+
+
+def parse_run_log(path: Path):
+    stats = []
+    port_stats = []
+    drops = []
+    injection_tables = []
+    current_table = None
+    flow_bytes = []
+
+    if not path.exists():
+        return {
+            "ocsStats": stats,
+            "ocsPortStats": port_stats,
+            "drops": drops,
+            "injectionTables": injection_tables,
+            "flowBytes": flow_bytes,
+        }
+
+    re_ocs_stats = re.compile(
+        r"\[OCS STATS\] node=(\d+).*?"
+        r"forwarded_packets=(\d+).*?"
+        r"forwarded_bytes=(\d+).*?"
+        r"drop_no_circuit=(\d+).*?"
+        r"drop_switching=(\d+).*?"
+        r"drop_bad_port=(\d+).*?"
+        r"drop_bad_device=(\d+)"
+    )
+
+    re_port = re.compile(
+        r"\[OCS PORT STATS\] node=(\d+) outPort=(\d+) packets=(\d+) bytes=(\d+)"
+    )
+
+    re_drop = re.compile(
+        r"\[OCS DROP SWITCHING\] t=(\d+) node=(\d+) inPort=(\d+) slice=(\d+) drop_switching=(\d+)"
+    )
+
+    re_tbl_begin = re.compile(
+        r"\[RNIC QP .*INJECTION TABLE BEGIN\] rnic=(\d+).*?epochNs=(\d+).*?periodNs=(\d+)"
+    )
+
+    re_win = re.compile(
+        r"window=(\d+) injectNs=\[(\d+),(\d+)\).*?dstRnics=\{([^}]*)\}"
+    )
+
+    re_flow_bytes = re.compile(
+        r"\[FLOW_RX_BYTES\].*?t=(\d+).*?flow_id=(\d+).*?(?:payload_bytes|bytes)=(\d+)"
+    )
+
+    for line in path.read_text(errors="ignore").splitlines():
+        m = re_ocs_stats.search(line)
+        if m:
+            stats.append({
+                "node": int(m.group(1)),
+                "forwardedPackets": int(m.group(2)),
+                "forwardedBytes": int(m.group(3)),
+                "dropNoCircuit": int(m.group(4)),
+                "dropSwitching": int(m.group(5)),
+                "dropBadPort": int(m.group(6)),
+                "dropBadDevice": int(m.group(7)),
+            })
+            continue
+
+        m = re_port.search(line)
+        if m:
+            port_stats.append({
+                "node": int(m.group(1)),
+                "outPort": int(m.group(2)),
+                "packets": int(m.group(3)),
+                "bytes": int(m.group(4)),
+            })
+            continue
+
+        m = re_drop.search(line)
+        if m:
+            drops.append({
+                "timeNs": int(m.group(1)),
+                "node": int(m.group(2)),
+                "inPort": int(m.group(3)),
+                "slice": int(m.group(4)),
+                "dropSwitching": int(m.group(5)),
+            })
+            continue
+
+        m = re_tbl_begin.search(line)
+        if m:
+            current_table = {
+                "rnic": int(m.group(1)),
+                "epochNs": int(m.group(2)),
+                "periodNs": int(m.group(3)),
+                "windows": [],
+            }
+            injection_tables.append(current_table)
+            continue
+
+        if "INJECTION TABLE END" in line:
+            current_table = None
+            continue
+
+        if current_table is not None:
+            m = re_win.search(line)
+            if m:
+                dsts = [int(x.strip()) for x in m.group(4).split(",") if x.strip()]
+                current_table["windows"].append({
+                    "window": int(m.group(1)),
+                    "startNs": int(m.group(2)),
+                    "endNs": int(m.group(3)),
+                    "dstRnics": dsts,
+                })
+            continue
+
+        m = re_flow_bytes.search(line)
+        if m:
+            flow_bytes.append({
+                "timeNs": int(m.group(1)),
+                "flowId": int(m.group(2)),
+                "bytes": int(m.group(3)),
+            })
+
+    return {
+        "ocsStats": stats,
+        "ocsPortStats": port_stats,
+        "drops": drops,
+        "injectionTables": injection_tables,
+        "flowBytes": flow_bytes,
+    }
+
+
+def build_throughput_from_flow_bytes(flow_bytes, flows, bucket_ns):
+    if not flow_bytes:
+        return []
+
+    grouped = {}
+
+    for ev in flow_bytes:
+        fid = ev["flowId"]
+        bucket = (ev["timeNs"] // bucket_ns) * bucket_ns
+        grouped.setdefault(fid, {})
+        grouped[fid][bucket] = grouped[fid].get(bucket, 0) + ev["bytes"]
+
+    series = []
+
+    for fid in sorted(grouped):
+        f = flows[fid] if 0 <= fid < len(flows) else None
+
+        label = f"flow{fid}"
+        if f:
+            label = f"flow{fid}: {f.src}→{f.dst} start={f.start_ns / 1e6:.3f}ms"
+
+        points = []
+
+        for t in sorted(grouped[fid]):
+            gbps = grouped[fid][t] * 8.0 / bucket_ns
+            points.append({
+                "timeNs": t,
+                "throughputGbps": gbps,
+            })
+
+        avg = sum(p["throughputGbps"] for p in points) / len(points) if points else 0.0
+
+        series.append({
+            "flowId": fid,
+            "label": label,
+            "avgThroughputGbps": avg,
+            "points": points,
+        })
+
+    return series
+
+
+def find_file(exp_dir: Path, names):
+    for sub in ["input", "output", "."]:
+        for name in names:
+            p = exp_dir / sub / name
+            if p.exists():
+                return p
+    return exp_dir / names[0]
+
+
+def build_experiment(exp_dir: Path, bucket_ns: int):
+    topology_path = find_file(exp_dir, ["01-ocs_test_topology.txt", "02-topology.txt", "topology.txt"])
+    schedule_path = find_file(exp_dir, ["05-ocs_test_schedule.txt", "05-ocs_schedule.txt", "schedule.txt"])
+    map_path = find_file(exp_dir, ["04-ocs_map.txt", "ocs_map.txt", "map.txt"])
+    flow_path = find_file(exp_dir, ["03-flow.txt", "flow.txt"])
+    config_path = find_file(exp_dir, ["config_ocs.txt", "config.txt"])
+    fct_path = find_file(exp_dir, ["ocs_fct.txt", "fct.txt"])
+    run_log_path = find_file(exp_dir, ["run.log", "latest_run.log"])
+
+    topology = parse_topology(topology_path)
+    config = parse_config(config_path)
+    flows = parse_flows(flow_path)
+    all_fct = parse_fct(fct_path)
+    flow_results = join_flow_fct_results(all_fct, flows)
+    fct = [r for r in flow_results if r.get("status") == "completed"]
+    log = parse_run_log(run_log_path)
+    throughput = build_throughput_from_flow_bytes(log.get("flowBytes", []), flows, bucket_ns)
+    
+    schedule = parse_schedule(schedule_path)
+    map_entries = parse_ocs_map(map_path)
+
+    # OCS_SCHEDULE_ENABLE 0 -> fixed map mode
+    # OCS_SCHEDULE_ENABLE 1 -> schedule mode
+    # If config is missing but map exists and schedule config does not exist, fall back to map.
+    if config.get("ocsMode") == "map" or (map_entries and not schedule.get("configs")):
+        schedule = {
+            "mode": "map",
+            "configs": [],
+            "entries": map_entries,
+        }
+    else:
+        schedule["mode"] = "schedule"
+
+    created = datetime.fromtimestamp(exp_dir.stat().st_mtime).isoformat(timespec="seconds")
+
+    rnic_count = len(topology.get("rnics", []))
+
+    summary = {
+        "nodeCount": rnic_count,
+        "totalNodeCount": topology.get("totalNodes", 0),
+        "ocsCount": topology.get("ocsCount", 0),
+        "epsCount": topology.get("switchCount", 0),
+        "flowCount": len(flows),
+        "ocsMode": config.get("ocsMode", "-"),
+        "ccMode": config.get("ccMode"),
+        "ccName": config.get("ccName", "-"),
+        "totalDropSwitching": sum(x.get("dropSwitching", 0) for x in log.get("ocsStats", [])),
+        "fctCount": len(fct),
+        "maxFctNs": max([x.get("fct_ns", 0) for x in fct], default=0),
+    }
+
+    if schedule.get("mode") == "map":
+        summary["ocsMode"] = "map"
+
+    return {
+        "id": exp_dir.name,
+        "title": exp_dir.name,
+        "createdAt": created,
+        "directory": str(exp_dir),
+        "topology": topology,
+        "schedule": schedule,
+        "config": config,
+        "flows": [asdict(f) for f in flows],
+        "flowResults": flow_results,
+        "fct": fct,
+        "throughput": throughput,
+        "log": log,
+        "summary": summary,
+    }
+
+
+def make_handler(sim_dir: Path, experiments_dir: Path, bucket_ns: int):
+    dashboard_dir = sim_dir / "dashboard"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            print("[HTTP]", fmt % args)
+
+        def send_json(self, obj):
+            data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+
+            if parsed.path == "/api/experiments":
+                experiments = []
+
+                dirs = []
+                if experiments_dir.exists():
+                    dirs = [p for p in experiments_dir.iterdir() if p.is_dir()]
+                    dirs.sort(key=lambda p: p.stat().st_mtime)
+
+                for exp_dir in dirs:
+                    try:
+                        experiments.append(build_experiment(exp_dir, bucket_ns))
+                    except Exception as exc:
+                        experiments.append({
+                            "id": exp_dir.name,
+                            "title": exp_dir.name,
+                            "error": str(exc),
+                            "summary": {},
+                        })
+
+                self.send_json({"experiments": experiments})
+                return
+
+            rel = parsed.path.lstrip("/") or "index.html"
+
+            if rel.startswith("api/") or ".." in Path(rel).parts:
+                self.send_error(404)
+                return
+
+            file_path = dashboard_dir / rel
+
+            if not file_path.exists() or not file_path.is_file():
+                self.send_error(404)
+                return
+
+            data = file_path.read_bytes()
+            ctype = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    return Handler
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Serve OCS/RDMA dashboard by dynamically scanning experiments/."
+    )
+    ap.add_argument("--sim-dir", default=str(SIM_DIR_DEFAULT))
+    ap.add_argument("--experiments-dir", default="experiments")
+    ap.add_argument("--bucket-ns", type=int, default=100_000)
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=8000)
+    args = ap.parse_args()
+
+    sim_dir = Path(args.sim_dir).resolve()
+
+    exp_dir = Path(args.experiments_dir)
+    if not exp_dir.is_absolute():
+        exp_dir = sim_dir / exp_dir
+
+    handler = make_handler(sim_dir, exp_dir, args.bucket_ns)
+    httpd = ThreadingHTTPServer((args.host, args.port), handler)
+
+    print(f"[INFO] dashboard: http://{args.host}:{args.port}")
+    print(f"[INFO] simulation dir: {sim_dir}")
+    print(f"[INFO] experiments dir: {exp_dir}")
+
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
