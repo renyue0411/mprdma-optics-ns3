@@ -425,6 +425,7 @@ def join_flow_fct_results(fct_records, flows):
                 "finish_ns": r.finish_ns,
                 "avg_throughput_gbps": r.avg_throughput_gbps,
                 "standalone_delay_ns": r.standalone_delay_ns,
+                "sport": r.sport,
                 "fct_index": r.index,
                 "fct_start_ns": r.start_ns,
                 "match_delta_ns": abs(r.start_ns - f.start_ns),
@@ -443,6 +444,7 @@ def join_flow_fct_results(fct_records, flows):
                 "finish_ns": None,
                 "avg_throughput_gbps": None,
                 "standalone_delay_ns": None,
+                "sport": None,
                 "fct_index": None,
                 "fct_start_ns": None,
                 "match_delta_ns": None,
@@ -494,8 +496,22 @@ def parse_run_log(path: Path):
         r"window=(\d+) injectNs=\[(\d+),(\d+)\).*?dstRnics=\{([^}]*)\}"
     )
 
+    # Old format:
+    #   [FLOW_RX_BYTES] t=... flow_id=... bytes=...
+    # New tuple format:
+    #   [FLOW_RX_BYTES] t=... src=... dst=... sport=... dport=... pg=... bytes=...
     re_flow_bytes = re.compile(
         r"\[FLOW_RX_BYTES\].*?t=(\d+).*?flow_id=(\d+).*?(?:payload_bytes|bytes)=(\d+)"
+    )
+
+    re_flow_bytes_tuple = re.compile(
+        r"\[FLOW_RX_BYTES\].*?t=(\d+)"
+        r".*?src=(\d+)"
+        r".*?dst=(\d+)"
+        r".*?sport=(\d+)"
+        r".*?dport=(\d+)"
+        r".*?pg=(\d+)"
+        r".*?(?:payload_bytes|bytes)=(\d+)"
     )
 
     for line in path.read_text(errors="ignore").splitlines():
@@ -560,6 +576,19 @@ def parse_run_log(path: Path):
                 })
             continue
 
+        m = re_flow_bytes_tuple.search(line)
+        if m:
+            flow_bytes.append({
+                "timeNs": int(m.group(1)),
+                "src": int(m.group(2)),
+                "dst": int(m.group(3)),
+                "sport": int(m.group(4)),
+                "dport": int(m.group(5)),
+                "pg": int(m.group(6)),
+                "bytes": int(m.group(7)),
+            })
+            continue
+
         m = re_flow_bytes.search(line)
         if m:
             flow_bytes.append({
@@ -577,42 +606,174 @@ def parse_run_log(path: Path):
     }
 
 
-def build_throughput_from_flow_bytes(flow_bytes, flows, bucket_ns):
+def _flow_tuple_key(src, dst, sport, dport, pg):
+    return (int(src), int(dst), int(sport), int(dport), int(pg))
+
+
+def _bucket_floor(t_ns, bucket_ns):
+    return (int(t_ns) // bucket_ns) * bucket_ns
+
+
+def _bucket_ceil(t_ns, bucket_ns):
+    t_ns = int(t_ns)
+    return ((t_ns + bucket_ns - 1) // bucket_ns) * bucket_ns
+
+
+def build_throughput_from_flow_bytes(flow_bytes, flows, flow_results, bucket_ns):
+    """
+    Build per-flow throughput timelines from [FLOW_RX_BYTES] records.
+
+    The dashboard intentionally fills missing buckets with zero so that OCS-gated
+    flows are shown as on/off intervals instead of misleading diagonal lines
+    between sparse non-zero samples.
+    """
     if not flow_bytes:
         return []
 
     grouped = {}
+    meta = {}
 
     for ev in flow_bytes:
-        fid = ev["flowId"]
-        bucket = (ev["timeNs"] // bucket_ns) * bucket_ns
-        grouped.setdefault(fid, {})
-        grouped[fid][bucket] = grouped[fid].get(bucket, 0) + ev["bytes"]
+        bucket = _bucket_floor(ev["timeNs"], bucket_ns)
+
+        if "flowId" in ev:
+            key = ("flowId", int(ev["flowId"]))
+            fid = int(ev["flowId"])
+            f = flows[fid] if 0 <= fid < len(flows) else None
+            if key not in meta:
+                meta[key] = {
+                    "flowId": fid,
+                    "label": f"flow{fid}" if f is None else f"{f.src}→{f.dst}",
+                    "src": f.src if f else None,
+                    "dst": f.dst if f else None,
+                    "sport": None,
+                    "dport": f.dport if f else None,
+                    "pg": f.pg if f else None,
+                    "startNs": f.start_ns if f else bucket,
+                    "finishNs": None,
+                    "fctAvgThroughputGbps": None,
+                    "sizeBytes": f.size_bytes if f else None,
+                }
+        else:
+            key = ("tuple", _flow_tuple_key(ev["src"], ev["dst"], ev["sport"], ev["dport"], ev["pg"]))
+            if key not in meta:
+                meta[key] = {
+                    "flowId": None,
+                    "label": f"{ev['src']}→{ev['dst']}",
+                    "src": ev["src"],
+                    "dst": ev["dst"],
+                    "sport": ev["sport"],
+                    "dport": ev["dport"],
+                    "pg": ev["pg"],
+                    "startNs": bucket,
+                    "finishNs": None,
+                    "fctAvgThroughputGbps": None,
+                    "sizeBytes": None,
+                }
+
+        grouped.setdefault(key, {})
+        grouped[key][bucket] = grouped[key].get(bucket, 0) + ev["bytes"]
+
+    completed = [r for r in flow_results if r.get("status") == "completed"]
+
+    # Attach FCT metadata when possible. This makes legend averages represent
+    # flow-size/FCT rather than the mean of active non-zero buckets.
+    for key, info in meta.items():
+        matched = None
+
+        for r in completed:
+            if info.get("src") is not None and r.get("src") != info.get("src"):
+                continue
+            if info.get("dst") is not None and r.get("dst") != info.get("dst"):
+                continue
+            if info.get("dport") is not None and r.get("dport") != info.get("dport"):
+                continue
+            if info.get("pg") is not None and r.get("pg") != info.get("pg"):
+                continue
+            if info.get("sport") is not None and r.get("sport") is not None and r.get("sport") != info.get("sport"):
+                continue
+
+            matched = r
+            break
+
+        if matched:
+            info["startNs"] = matched.get("start_ns") if matched.get("start_ns") is not None else info.get("startNs")
+            info["finishNs"] = matched.get("finish_ns")
+            info["fctAvgThroughputGbps"] = matched.get("avg_throughput_gbps")
+            info["sizeBytes"] = matched.get("size_bytes")
 
     series = []
 
-    for fid in sorted(grouped):
-        f = flows[fid] if 0 <= fid < len(flows) else None
+    def sort_key(item):
+        key, info = item
+        return (
+            info.get("src") if info.get("src") is not None else 1 << 30,
+            info.get("dst") if info.get("dst") is not None else 1 << 30,
+            info.get("sport") if info.get("sport") is not None else -1,
+            info.get("dport") if info.get("dport") is not None else -1,
+            str(key),
+        )
 
-        label = f"flow{fid}"
-        if f:
-            label = f"flow{fid}: {f.src}→{f.dst} start={f.start_ns / 1e6:.3f}ms"
+    for key, info in sorted(meta.items(), key=sort_key):
+        buckets = grouped.get(key, {})
+        if not buckets:
+            continue
+
+        first_event_bucket = min(buckets)
+        last_event_bucket = max(buckets)
+
+        start_ns = info.get("startNs")
+        if start_ns is None:
+            start_ns = first_event_bucket
+
+        finish_ns = info.get("finishNs")
+        if finish_ns is None:
+            # Include the last non-empty bucket interval when FCT is unavailable.
+            finish_ns = last_event_bucket + bucket_ns
+
+        start_bucket = min(_bucket_floor(start_ns, bucket_ns), first_event_bucket)
+        end_bucket = max(_bucket_ceil(finish_ns, bucket_ns), last_event_bucket + bucket_ns)
 
         points = []
+        active_values = []
+        total_bytes = 0
 
-        for t in sorted(grouped[fid]):
-            gbps = grouped[fid][t] * 8.0 / bucket_ns
+        t = start_bucket
+        while t < end_bucket:
+            b = buckets.get(t, 0)
+            total_bytes += b
+            gbps = b * 8.0 / bucket_ns
+            if b > 0:
+                active_values.append(gbps)
             points.append({
                 "timeNs": t,
                 "throughputGbps": gbps,
+                "bytes": b,
             })
+            t += bucket_ns
 
-        avg = sum(p["throughputGbps"] for p in points) / len(points) if points else 0.0
+        active_avg = sum(active_values) / len(active_values) if active_values else 0.0
+
+        fct_avg = info.get("fctAvgThroughputGbps")
+        if fct_avg is None:
+            duration = max(1, end_bucket - start_bucket)
+            fct_avg = total_bytes * 8.0 / duration
+
+        label = info.get("label") or str(key)
 
         series.append({
-            "flowId": fid,
+            "flowId": info.get("flowId"),
+            "src": info.get("src"),
+            "dst": info.get("dst"),
+            "sport": info.get("sport"),
+            "dport": info.get("dport"),
+            "pg": info.get("pg"),
             "label": label,
-            "avgThroughputGbps": avg,
+            "avgThroughputGbps": fct_avg,
+            "fctAvgThroughputGbps": fct_avg,
+            "activeAvgThroughputGbps": active_avg,
+            "totalRxBytes": total_bytes,
+            "bucketNs": bucket_ns,
             "points": points,
         })
 
@@ -644,7 +805,7 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
     flow_results = join_flow_fct_results(all_fct, flows)
     fct = [r for r in flow_results if r.get("status") == "completed"]
     log = parse_run_log(run_log_path)
-    throughput = build_throughput_from_flow_bytes(log.get("flowBytes", []), flows, bucket_ns)
+    throughput = build_throughput_from_flow_bytes(log.get("flowBytes", []), flows, flow_results, bucket_ns)
     
     schedule = parse_schedule(schedule_path)
     map_entries = parse_ocs_map(map_path)
@@ -781,13 +942,27 @@ def main():
         exp_dir = sim_dir / exp_dir
 
     handler = make_handler(sim_dir, exp_dir, args.bucket_ns)
-    httpd = ThreadingHTTPServer((args.host, args.port), handler)
+
+    class DashboardHTTPServer(ThreadingHTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    httpd = DashboardHTTPServer((args.host, args.port), handler)
 
     print(f"[INFO] dashboard: http://{args.host}:{args.port}")
     print(f"[INFO] simulation dir: {sim_dir}")
     print(f"[INFO] experiments dir: {exp_dir}")
+    print("[INFO] press Ctrl+C to stop the dashboard server")
 
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[INFO] received Ctrl+C; stopping dashboard server...")
+    finally:
+        httpd.server_close()
+        print("[INFO] dashboard server stopped")
+
+    return 0
 
 
 if __name__ == "__main__":

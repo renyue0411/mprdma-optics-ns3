@@ -1494,6 +1494,9 @@ int main(int argc, char *argv[])
 			}
 	}
 
+	RdmaHw::ClearFlowRxTrace();
+	RdmaHw::ConfigureFlowRxTrace(true, 100000); // 100 us buckets for dashboard throughput timeline
+
 	flow_input.idx = 0;
 	if (flow_num > 0)
 	{
@@ -1522,6 +1525,7 @@ int main(int argc, char *argv[])
 	NS_LOG_INFO("Run Simulation.");
 	Simulator::Stop(Seconds(simulator_stop_time));
 	Simulator::Run();
+	RdmaHw::DumpFlowRxTrace(std::cout);
     for (std::set<uint32_t>::iterator it = ocs_node_ids.begin();
 		it != ocs_node_ids.end();
 		++it) {

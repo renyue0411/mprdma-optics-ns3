@@ -7,6 +7,7 @@
 #include <ns3/custom-header.h>
 #include "qbb-net-device.h"
 #include <unordered_map>
+#include <ostream>
 #include "pint.h"
 
 namespace ns3 {
@@ -61,6 +62,11 @@ public:
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb); // setup shared data and callbacks with the QbbNetDevice
+
+	// Dashboard support: aggregate receiver-side delivered payload bytes per flow.
+	static void ConfigureFlowRxTrace(bool enabled, uint64_t bucketNs);
+	static void ClearFlowRxTrace();
+	static void DumpFlowRxTrace(std::ostream &os);
 	void EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots);
 	void DisableRnicGate();
 	bool RnicGateAllowsQp(Ptr<RdmaQueuePair> qp) const;

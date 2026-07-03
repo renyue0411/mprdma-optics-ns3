@@ -15,8 +15,53 @@
 #include "qbb-header.h"
 #include "cn-header.h"
 
+#include <map>
+#include <tuple>
+
 namespace ns3
 {
+
+namespace
+{
+	struct FlowRxTraceKey
+	{
+		uint32_t src;
+		uint32_t dst;
+		uint16_t sport;
+		uint16_t dport;
+		uint16_t pg;
+
+		bool operator<(const FlowRxTraceKey &other) const
+		{
+			return std::tie(src, dst, sport, dport, pg) <
+			       std::tie(other.src, other.dst, other.sport, other.dport, other.pg);
+		}
+	};
+
+	bool g_flowRxTraceEnabled = false;
+	uint64_t g_flowRxTraceBucketNs = 100000;
+	std::map<FlowRxTraceKey, std::map<uint64_t, uint64_t> > g_flowRxTraceBytes;
+
+	uint32_t IpToNodeId(uint32_t ip)
+	{
+		return (ip >> 8) & 0xffff;
+	}
+
+	void RecordFlowRxBytes(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport,
+	                       uint16_t pg, uint64_t bytes)
+	{
+		if (!g_flowRxTraceEnabled || bytes == 0 || g_flowRxTraceBucketNs == 0)
+		{
+			return;
+		}
+
+		uint64_t nowNs = Simulator::Now().GetTimeStep();
+		uint64_t bucketNs = (nowNs / g_flowRxTraceBucketNs) * g_flowRxTraceBucketNs;
+		FlowRxTraceKey key = {IpToNodeId(sip), IpToNodeId(dip), sport, dport, pg};
+		g_flowRxTraceBytes[key][bucketNs] += bytes;
+	}
+}
+
 
 	TypeId RdmaHw::GetTypeId(void)
 	{
@@ -186,6 +231,40 @@ namespace ns3
 		m_rnicGateRnicId = 0;
 		m_rnicGateEpochStartNs = 0;
 		m_rnicGatePeriodNs = 0;
+	}
+
+	void RdmaHw::ConfigureFlowRxTrace(bool enabled, uint64_t bucketNs)
+	{
+		g_flowRxTraceEnabled = enabled;
+		if (bucketNs > 0)
+		{
+			g_flowRxTraceBucketNs = bucketNs;
+		}
+	}
+
+	void RdmaHw::ClearFlowRxTrace()
+	{
+		g_flowRxTraceBytes.clear();
+	}
+
+	void RdmaHw::DumpFlowRxTrace(std::ostream &os)
+	{
+		for (const auto &flowIt : g_flowRxTraceBytes)
+		{
+			const FlowRxTraceKey &key = flowIt.first;
+			for (const auto &bucketIt : flowIt.second)
+			{
+				os << "[FLOW_RX_BYTES]"
+				   << " t=" << bucketIt.first
+				   << " src=" << key.src
+				   << " dst=" << key.dst
+				   << " sport=" << key.sport
+				   << " dport=" << key.dport
+				   << " pg=" << key.pg
+				   << " bytes=" << bucketIt.second
+				   << std::endl;
+			}
+		}
 	}
 
 	void RdmaHw::SetNode(Ptr<Node> node)
@@ -455,7 +534,15 @@ namespace ns3
 		rxQp->m_ecn_source.total++;
 		rxQp->m_milestone_rx = m_ack_interval;
 
+		uint32_t expectedBefore = rxQp->ReceiverNextExpectedSeq;
 		int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+		uint32_t expectedAfter = rxQp->ReceiverNextExpectedSeq;
+		if (expectedAfter > expectedBefore)
+		{
+			RecordFlowRxBytes(ch.sip, ch.dip, ch.udp.sport, ch.udp.dport,
+			                  ch.udp.pg, expectedAfter - expectedBefore);
+		}
+
 		if (x == 1 || x == 2)
 		{ // generate ACK or NACK
 			qbbHeader seqh;

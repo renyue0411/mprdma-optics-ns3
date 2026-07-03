@@ -1243,7 +1243,21 @@ function renderThroughput(exp) {
   }
 
   const normalize = document.getElementById('normalizeTime').checked;
-  const allPts = series.flatMap(s => s.points || []);
+  const allPts = series.flatMap(s => {
+    const pts = s.points || [];
+    if (!pts.length) return [];
+
+    const sorted = pts.slice().sort((a, b) => a.timeNs - b.timeNs);
+    const bucketNs = s.bucketNs || inferBucketNs(sorted);
+    const last = sorted[sorted.length - 1];
+
+    // Include the synthetic baseline endpoint in the x-axis range so that
+    // a flow can visually return to 0 after its last sampled bucket.
+    return sorted.concat([{
+      timeNs: last.timeNs + bucketNs,
+      throughputGbps: 0
+    }]);
+  });
   const minT = Math.min(...allPts.map(p => p.timeNs));
   const maxT = Math.max(...allPts.map(p => p.timeNs));
   const maxY = Math.max(0.001, ...allPts.map(p => p.throughputGbps || 0));
@@ -1289,13 +1303,54 @@ function renderThroughput(exp) {
     grid.push(`<text class="axis-label" x="${xx}" y="${h - 18}" text-anchor="middle">${fmtNs(Math.round(labelNs))}</text>`);
   }
 
+  function inferBucketNs(points) {
+    if (!points || points.length < 2) return 1;
+
+    const times = Array.from(new Set(points.map(p => p.timeNs))).sort((a, b) => a - b);
+    let best = null;
+
+    for (let i = 1; i < times.length; i++) {
+      const d = times[i] - times[i - 1];
+      if (d > 0 && (best === null || d < best)) {
+        best = d;
+      }
+    }
+
+    return best || 1;
+  }
+
+  function buildStepPath(points, bucketNs) {
+    if (!points || !points.length) return '';
+
+    const sorted = points.slice().sort((a, b) => a.timeNs - b.timeNs);
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const endTime = last.timeNs + (bucketNs || inferBucketNs(sorted));
+
+    // Anchor every series on the x-axis, then step up/down at bucket
+    // boundaries. This prevents the line from visually starting or ending
+    // in the middle of the plot when the first/last bucket has non-zero bytes.
+    let d = `M ${x(first.timeNs).toFixed(1)} ${y(0).toFixed(1)}`;
+    d += ` V ${y(first.throughputGbps || 0).toFixed(1)}`;
+
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1];
+      const cur = sorted[i];
+      const cx = x(cur.timeNs).toFixed(1);
+      const cy = y(cur.throughputGbps || 0).toFixed(1);
+      d += ` H ${cx} V ${cy}`;
+    }
+
+    d += ` H ${x(endTime).toFixed(1)} V ${y(0).toFixed(1)}`;
+
+    return d;
+  }
+
   const lines = series.map((s, idx) => {
     const color = COLORS[idx % COLORS.length];
-    const pts = (s.points || [])
-      .map(p => `${x(p.timeNs).toFixed(1)},${y(p.throughputGbps || 0).toFixed(1)}`)
-      .join(' ');
+    const d = buildStepPath(s.points || [], s.bucketNs);
 
-    return `<polyline class="flow-line" points="${pts}" stroke="${color}"/>`;
+    return `<path class="flow-line" d="${d}" stroke="${color}"/>`;
   }).join('');
 
   root.innerHTML = `
@@ -1309,12 +1364,30 @@ function renderThroughput(exp) {
     </svg>
   `;
 
-  legend.innerHTML = series.map((s, idx) => `
-    <div class="legend-item">
-      <span class="legend-swatch" style="background:${COLORS[idx % COLORS.length]}"></span>
-      ${escapeHtml(s.label)} · avg ${fmtGbps(s.avgThroughputGbps)}
-    </div>
-  `).join('');
+  legend.innerHTML = series.map((s, idx) => {
+    const visibleParts = [s.label || '-'];
+
+    if (s.sport !== null && s.sport !== undefined) visibleParts.push(`sport=${s.sport}`);
+    if (s.dport !== null && s.dport !== undefined) visibleParts.push(`dport=${s.dport}`);
+    if (s.pg !== null && s.pg !== undefined) visibleParts.push(`priorityG=${s.pg}`);
+
+    const detailParts = [];
+    const fctAvg = s.fctAvgThroughputGbps ?? s.avgThroughputGbps;
+    const activeAvg = s.activeAvgThroughputGbps;
+
+    if (fctAvg !== null && fctAvg !== undefined) detailParts.push(`FCT avg ${fmtGbps(fctAvg)}`);
+    if (activeAvg !== null && activeAvg !== undefined) detailParts.push(`active avg ${fmtGbps(activeAvg)}`);
+
+    const title = escapeHtml(detailParts.join(' · '));
+    const visibleLabel = visibleParts.join(' ');
+
+    return `
+      <div class="legend-item" title="${title}">
+        <span class="legend-swatch" style="background:${COLORS[idx % COLORS.length]}"></span>
+        ${escapeHtml(visibleLabel)}
+      </div>
+    `;
+  }).join('');
 }
 
 function renderTable(rootId, columns, rows) {
