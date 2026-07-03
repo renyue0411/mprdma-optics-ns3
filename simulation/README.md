@@ -294,11 +294,9 @@ python3 scripts/run_dashboard_experiment.py --name exp_1
 ```
 
 ## Dashboard
-![OCS/RDMA dashboard overview](simulation/dashboard/assets/dashboard-overview.png)
+![OCS/RDMA dashboard overview](/dashboard/assets/dashboard-overview.png)
 
 This repository includes a lightweight web dashboard for visualizing OCS/RDMA experiments.
-
-Start the dashboard server from the `simulation/` directory:
 
 ```bash
 python3 dashboard/run_serve.py --host 0.0.0.0 --port 8000
