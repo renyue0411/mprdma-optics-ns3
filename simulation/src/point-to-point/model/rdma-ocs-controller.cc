@@ -977,11 +977,14 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
         }
     }
 
-  SimpleDsu staticDsu (nextVertex);
-  for (uint32_t i = 0; i < staticEdges.size (); ++i)
-    {
-      staticDsu.Unite (staticEdges[i].a, staticEdges[i].b);
-    }
+  /*
+   * Do not pre-eliminate destinations that are already reachable through
+   * static EPS edges.  The RNIC gate table is a per-window reachability
+   * bitmap over the mixed fabric, not an OCS-only bitmap.  Static EPS
+   * reachability must therefore be present in every applicable window;
+   * otherwise same-ToR or multi-hop-EPS traffic is incorrectly blocked
+   * when the RNIC gate is enabled.
+   */
 
   auto GetEndpointSourceOffsetNs =
     [&] (const RnicGroup &group, uint32_t packetBytes) -> uint64_t
@@ -1313,17 +1316,14 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
                              "destination group not found");
               const RnicGroup &dstGroupObj = dstGroupObjIt->second;
 
-              if (srcGroup == dstGroup)
-                {
-                  continue;
-                }
-
+              /*
+               * Keep srcGroup == dstGroup and static-EPS-reachable
+               * destinations.  They are valid destinations for the RNIC
+               * injection table.  The per-RNIC bitmap expansion below will
+               * remove only dstRnic == srcRnic, so intra-group traffic such
+               * as 6->7 remains injectable.
+               */
               if (dsu.Find (srcVertex) != dsu.Find (dstVertex))
-                {
-                  continue;
-                }
-
-              if (staticDsu.Find (srcVertex) == staticDsu.Find (dstVertex))
                 {
                   continue;
                 }
@@ -1438,17 +1438,17 @@ RdmaOcsController::CompileRnicReachabilityWindows ()
                     }
                 }
 
-              if (maxDeadlineOffsetNs == 0)
-                {
-                  continue;
-                }
+              uint64_t latestInjectNs = intervalEndNs;
 
-              if (intervalEndNs <= maxDeadlineOffsetNs)
+              if (maxDeadlineOffsetNs > 0)
                 {
-                  continue;
-                }
+                  if (intervalEndNs <= maxDeadlineOffsetNs)
+                    {
+                      continue;
+                    }
 
-              uint64_t latestInjectNs = intervalEndNs - maxDeadlineOffsetNs;
+                  latestInjectNs = intervalEndNs - maxDeadlineOffsetNs;
+                }
 
               if (latestInjectNs <= intervalStartNs)
                 {
@@ -1609,19 +1609,99 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
         }
     }
 
+  /*
+   * Normalize overlapping reachability windows into disjoint time ranges.
+   * The gate installed in RdmaHw is keyed by time first and then bitmap, so
+   * overlapping slots with different bitmaps can accidentally mask each
+   * other depending on lookup order.  For each RNIC, split at every boundary
+   * and OR all raw windows that cover the resulting atomic interval.
+   */
   for (std::map<uint32_t, std::vector<DumpSlot> >::iterator it =
          tables.begin ();
        it != tables.end ();
        ++it)
     {
-      std::sort (it->second.begin (), it->second.end (),
-                 [] (const DumpSlot &a, const DumpSlot &b) {
-                   if (a.startOffsetNs != b.startOffsetNs)
-                     {
-                       return a.startOffsetNs < b.startOffsetNs;
-                     }
-                   return a.endOffsetNs < b.endOffsetNs;
-                 });
+      std::vector<DumpSlot> rawSlots = it->second;
+      std::vector<uint64_t> boundaries;
+
+      for (uint32_t k = 0; k < rawSlots.size (); ++k)
+        {
+          if (rawSlots[k].endOffsetNs <= rawSlots[k].startOffsetNs)
+            {
+              continue;
+            }
+          boundaries.push_back (rawSlots[k].startOffsetNs);
+          boundaries.push_back (rawSlots[k].endOffsetNs);
+        }
+
+      std::sort (boundaries.begin (), boundaries.end ());
+      boundaries.erase (std::unique (boundaries.begin (), boundaries.end ()),
+                        boundaries.end ());
+
+      std::vector<DumpSlot> normalizedSlots;
+      for (uint32_t b = 0; b + 1 < boundaries.size (); ++b)
+        {
+          uint64_t startOffsetNs = boundaries[b];
+          uint64_t endOffsetNs = boundaries[b + 1];
+
+          if (endOffsetNs <= startOffsetNs)
+            {
+              continue;
+            }
+
+          DumpSlot slot;
+          slot.startOffsetNs = startOffsetNs;
+          slot.endOffsetNs = endOffsetNs;
+          slot.periodNs = 0;
+          slot.bitmapWords.assign (bitmapWordCount, 0);
+
+          for (uint32_t k = 0; k < rawSlots.size (); ++k)
+            {
+              const DumpSlot &raw = rawSlots[k];
+              if (raw.startOffsetNs <= startOffsetNs &&
+                  endOffsetNs <= raw.endOffsetNs)
+                {
+                  slot.periodNs = raw.periodNs;
+                  for (uint32_t w = 0; w < slot.bitmapWords.size (); ++w)
+                    {
+                      slot.bitmapWords[w] |= raw.bitmapWords[w];
+                    }
+                  slot.dstRnics.insert (raw.dstRnics.begin (),
+                                        raw.dstRnics.end ());
+                }
+            }
+
+          bool hasDst = false;
+          for (uint32_t w = 0; w < slot.bitmapWords.size (); ++w)
+            {
+              if (slot.bitmapWords[w] != 0)
+                {
+                  hasDst = true;
+                  break;
+                }
+            }
+
+          if (!hasDst)
+            {
+              continue;
+            }
+
+          if (!normalizedSlots.empty () &&
+              normalizedSlots.back ().endOffsetNs == slot.startOffsetNs &&
+              normalizedSlots.back ().periodNs == slot.periodNs &&
+              normalizedSlots.back ().bitmapWords == slot.bitmapWords)
+            {
+              normalizedSlots.back ().endOffsetNs = slot.endOffsetNs;
+              normalizedSlots.back ().dstRnics.insert (slot.dstRnics.begin (),
+                                                       slot.dstRnics.end ());
+            }
+          else
+            {
+              normalizedSlots.push_back (slot);
+            }
+        }
+
+      it->second = normalizedSlots;
     }
 
   for (uint32_t i = 0; i < allRnicNodes.size (); ++i)
@@ -1804,6 +1884,94 @@ RdmaOcsController::InstallRnicGateTablesToRdmaHw () const
               slot->bitmapWords[wordIndex] |= (1ULL << bitIndex);
             }
         }
+    }
+
+  /*
+   * Install only disjoint slots.  This mirrors the dump normalization above
+   * and makes the hardware gate lookup independent of slot iteration order.
+   */
+  for (std::map<uint32_t, std::vector<GateSlot> >::iterator it =
+         tables.begin ();
+       it != tables.end ();
+       ++it)
+    {
+      std::vector<GateSlot> rawSlots = it->second;
+      std::vector<uint64_t> boundaries;
+
+      for (uint32_t k = 0; k < rawSlots.size (); ++k)
+        {
+          if (rawSlots[k].endOffsetNs <= rawSlots[k].startOffsetNs)
+            {
+              continue;
+            }
+          boundaries.push_back (rawSlots[k].startOffsetNs);
+          boundaries.push_back (rawSlots[k].endOffsetNs);
+        }
+
+      std::sort (boundaries.begin (), boundaries.end ());
+      boundaries.erase (std::unique (boundaries.begin (), boundaries.end ()),
+                        boundaries.end ());
+
+      std::vector<GateSlot> normalizedSlots;
+      for (uint32_t b = 0; b + 1 < boundaries.size (); ++b)
+        {
+          uint64_t startOffsetNs = boundaries[b];
+          uint64_t endOffsetNs = boundaries[b + 1];
+
+          if (endOffsetNs <= startOffsetNs)
+            {
+              continue;
+            }
+
+          GateSlot slot;
+          slot.startOffsetNs = startOffsetNs;
+          slot.endOffsetNs = endOffsetNs;
+          slot.periodNs = 0;
+          slot.bitmapWords.assign (bitmapWordCount, 0);
+
+          for (uint32_t k = 0; k < rawSlots.size (); ++k)
+            {
+              const GateSlot &raw = rawSlots[k];
+              if (raw.startOffsetNs <= startOffsetNs &&
+                  endOffsetNs <= raw.endOffsetNs)
+                {
+                  slot.periodNs = raw.periodNs;
+                  for (uint32_t w = 0; w < slot.bitmapWords.size (); ++w)
+                    {
+                      slot.bitmapWords[w] |= raw.bitmapWords[w];
+                    }
+                }
+            }
+
+          bool hasDst = false;
+          for (uint32_t w = 0; w < slot.bitmapWords.size (); ++w)
+            {
+              if (slot.bitmapWords[w] != 0)
+                {
+                  hasDst = true;
+                  break;
+                }
+            }
+
+          if (!hasDst)
+            {
+              continue;
+            }
+
+          if (!normalizedSlots.empty () &&
+              normalizedSlots.back ().endOffsetNs == slot.startOffsetNs &&
+              normalizedSlots.back ().periodNs == slot.periodNs &&
+              normalizedSlots.back ().bitmapWords == slot.bitmapWords)
+            {
+              normalizedSlots.back ().endOffsetNs = slot.endOffsetNs;
+            }
+          else
+            {
+              normalizedSlots.push_back (slot);
+            }
+        }
+
+      it->second = normalizedSlots;
     }
 
   for (uint32_t i = 0; i < allRnicNodes.size (); ++i)
