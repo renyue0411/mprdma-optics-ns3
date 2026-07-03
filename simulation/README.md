@@ -290,7 +290,6 @@ The direct command to run the OCS/RDMA simulator is:
 A dashboard-compatible experiment can be run and archived with:
 
 ```bash
-cd simulation
 python3 scripts/run_dashboard_experiment.py --name exp_1
 ```
 
