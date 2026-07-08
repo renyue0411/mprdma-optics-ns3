@@ -74,6 +74,7 @@ std::string ocs_map_file = "";
 // and installs a periodic time-sliced OCS schedule with switching blackout.
 uint32_t ocs_schedule_enable = 0;
 std::string ocs_schedule_file = "";
+uint32_t rnic_gate_enable = 1;
 
 // Topology link format.
 //   auto: 3-field header uses legacy links; 4-field header auto-detects
@@ -886,6 +887,10 @@ int main(int argc, char *argv[])
 				conf >> ocs_schedule_file;
 				std::cout << "OCS_SCHEDULE_FILE\t\t" << ocs_schedule_file << "\n";
 			}
+			else if (key.compare("RNIC_GATE_ENABLE") == 0) {
+				conf >> rnic_gate_enable;
+				std::cout << "RNIC_GATE_ENABLE\t\t" << rnic_gate_enable << "\n";
+			}
 			fflush(stdout);
 		}
 		conf.close();
@@ -1281,24 +1286,21 @@ int main(int argc, char *argv[])
 		dstDev->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback(&get_pfc, pfc_file, dstDev));
 	}
 
-	if (ocs_schedule_enable && !ocs_node_ids.empty())
-	{
+	if (ocs_schedule_enable && !ocs_node_ids.empty()) {
 		rdmaOcsController->LoadAndInstallOcsSchedule(ocs_schedule_file);
 
-		rdmaOcsController->BuildRnicGroups();
-		rdmaOcsController->DumpRnicGroups();
-
-		rdmaOcsController->CompileRnicReachabilityWindows();
-		rdmaOcsController->DumpRnicReachabilityWindows();
-	}
-	else if (!ocs_node_ids.empty())
-	{
+		if (rnic_gate_enable) {
+			rdmaOcsController->BuildRnicGroups();
+			rdmaOcsController->DumpRnicGroups();
+			rdmaOcsController->CompileRnicReachabilityWindows();
+			rdmaOcsController->DumpRnicReachabilityWindows();
+		} else {
+			std::cout << "[RNIC GATE DISABLED] mode=default_rdma reason=RNIC_GATE_ENABLE_0" << std::endl;
+		}
+	} else if (!ocs_node_ids.empty()) {
 		rdmaOcsController->LoadAndInstallOcsMap(ocs_map_file);
-	}
-	else
-	{
-		std::cout << "[OCS DISABLED] no OCS nodes; skip OCS controller"
-				<< std::endl;
+	} else {
+		std::cout << "[OCS DISABLED] no OCS nodes; skip OCS controller" << std::endl;
 	}
 
 	nic_rate = get_nic_rate(n);
@@ -1385,9 +1387,10 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-	if (ocs_schedule_enable && !ocs_node_ids.empty())
-	{
+	if (ocs_schedule_enable && !ocs_node_ids.empty() && rnic_gate_enable) {
 		rdmaOcsController->InstallRnicGateTablesToRdmaHw();
+	} else if (ocs_schedule_enable && !ocs_node_ids.empty() && !rnic_gate_enable) {
+		std::cout << "[RNIC GATE INSTALL SKIP] mode=default_rdma reason=RNIC_GATE_ENABLE_0" << std::endl;
 	}
 
 	// set ACK priority on hosts

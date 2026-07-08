@@ -88,18 +88,22 @@ def parse_config(path: Path):
 
     cc_code = safe_int(cfg.get("CC_MODE"), None)
     schedule_enable = safe_int(cfg.get("OCS_SCHEDULE_ENABLE"), None)
+    rnic_gate_enable = safe_int(cfg.get("RNIC_GATE_ENABLE"), 1)
 
     return {
         "raw": cfg,
         "ccMode": cc_code,
         "ccName": CC_NAMES.get(cc_code, f"UNKNOWN({cc_code})" if cc_code is not None else "-"),
         "ocsMode": "schedule" if schedule_enable == 1 else ("map" if schedule_enable == 0 else "-"),
+        "rnicGateEnable": rnic_gate_enable,
+        "rnicGateMode": "enabled" if rnic_gate_enable == 1 else "disabled",
     }
 
 
 def parse_topology(path: Path):
     lines = read_lines(path)
-    if len(lines) < 3:
+
+    if not lines:
         return {
             "nodes": [],
             "links": [],
@@ -109,16 +113,56 @@ def parse_topology(path: Path):
             "totalNodes": 0,
             "switchCount": 0,
             "ocsCount": 0,
+            "linkCount": 0,
+            "ocsPortToNeighbor": {},
         }
 
     first = lines[0].split()
-    total_nodes = int(first[0])
-    switch_count = int(first[1])
-    ocs_count = int(first[2])
-    link_count = int(first[3])
 
-    switches = [int(x) for x in lines[1].split()] if switch_count else []
-    ocs_nodes = [int(x) for x in lines[2].split()] if ocs_count else []
+    if len(first) == 3:
+        # Legacy format:
+        # total_node_num switch_node_num link_num
+        total_nodes = int(first[0])
+        switch_count = int(first[1])
+        ocs_count = 0
+        link_count = int(first[2])
+        header_mode = "legacy"
+    elif len(first) == 4:
+        # OCS-aware format:
+        # total_node_num switch_node_num ocs_node_num link_num
+        total_nodes = int(first[0])
+        switch_count = int(first[1])
+        ocs_count = int(first[2])
+        link_count = int(first[3])
+        header_mode = "ocs"
+    else:
+        return {
+            "nodes": [],
+            "links": [],
+            "switches": [],
+            "ocs": [],
+            "rnics": [],
+            "totalNodes": 0,
+            "switchCount": 0,
+            "ocsCount": 0,
+            "linkCount": 0,
+            "ocsPortToNeighbor": {},
+            "error": f"invalid topology header: {lines[0]}",
+        }
+
+    idx = 1
+
+    switches = []
+    if switch_count > 0:
+        if idx < len(lines):
+            switches = [int(x) for x in lines[idx].split()]
+        idx += 1
+
+    ocs_nodes = []
+    if ocs_count > 0:
+        if idx < len(lines):
+            ocs_nodes = [int(x) for x in lines[idx].split()]
+        idx += 1
 
     switch_set = set(switches)
     ocs_set = set(ocs_nodes)
@@ -131,33 +175,86 @@ def parse_topology(path: Path):
             ntype = "eps"
         else:
             ntype = "rnic"
-        nodes.append({"id": nid, "type": ntype})
+
+        nodes.append({
+            "id": nid,
+            "type": ntype,
+        })
 
     links = []
     port_to_neighbor = {}
 
-    for line in lines[3:3 + link_count]:
+    for line in lines[idx:idx + link_count]:
         parts = line.split()
+
         if len(parts) < 5:
             continue
 
-        src = int(parts[0])
-        dst = int(parts[1])
+        try:
+            src = int(parts[0])
+            dst = int(parts[1])
+        except Exception:
+            continue
+
         src_port = None
         dst_port = None
 
-        if src in ocs_set and dst in ocs_set:
-            src_port = int(parts[2])
-            dst_port = int(parts[3])
-            rate, delay, err = parts[4], parts[5], parts[6]
-        elif src in ocs_set:
-            src_port = int(parts[2])
-            rate, delay, err = parts[3], parts[4], parts[5]
-        elif dst in ocs_set:
-            dst_port = int(parts[2])
-            rate, delay, err = parts[3], parts[4], parts[5]
-        else:
-            rate, delay, err = parts[2], parts[3], parts[4]
+        try:
+            if src in ocs_set and dst in ocs_set:
+                # compact_ocs_ports / with_ocs_ports:
+                # src dst src_ocs_port dst_ocs_port rate delay error
+                if len(parts) < 7:
+                    continue
+
+                src_port = int(parts[2])
+                dst_port = int(parts[3])
+                rate, delay, err = parts[4], parts[5], parts[6]
+
+            elif src in ocs_set:
+                # compact_ocs_ports:
+                # src dst src_ocs_port rate delay error
+                #
+                # with_ocs_ports, if used:
+                # src dst src_port dst_port rate delay error
+                if len(parts) >= 7:
+                    src_port = int(parts[2])
+                    # dst is not OCS, so dst_port is not needed by dashboard.
+                    rate, delay, err = parts[4], parts[5], parts[6]
+                elif len(parts) >= 6:
+                    src_port = int(parts[2])
+                    rate, delay, err = parts[3], parts[4], parts[5]
+                else:
+                    continue
+
+            elif dst in ocs_set:
+                # compact_ocs_ports:
+                # src dst dst_ocs_port rate delay error
+                #
+                # with_ocs_ports, if used:
+                # src dst src_port dst_port rate delay error
+                if len(parts) >= 7:
+                    # src is not OCS, so src_port is not needed by dashboard.
+                    dst_port = int(parts[3])
+                    rate, delay, err = parts[4], parts[5], parts[6]
+                elif len(parts) >= 6:
+                    dst_port = int(parts[2])
+                    rate, delay, err = parts[3], parts[4], parts[5]
+                else:
+                    continue
+
+            else:
+                # Legacy / normal EPS link:
+                # src dst rate delay error
+                #
+                # If a with_ocs_ports-style non-OCS link appears:
+                # src dst src_port dst_port rate delay error
+                if len(parts) >= 7:
+                    rate, delay, err = parts[4], parts[5], parts[6]
+                else:
+                    rate, delay, err = parts[2], parts[3], parts[4]
+
+        except Exception:
+            continue
 
         link = Link(src, dst, src_port, dst_port, rate, delay, err)
         links.append(asdict(link))
@@ -179,6 +276,7 @@ def parse_topology(path: Path):
         "switchCount": switch_count,
         "ocsCount": ocs_count,
         "linkCount": link_count,
+        "headerMode": header_mode,
         "switches": switches,
         "ocs": ocs_nodes,
         "rnics": [n["id"] for n in nodes if n["type"] == "rnic"],
@@ -838,6 +936,7 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
         "totalDropSwitching": sum(x.get("dropSwitching", 0) for x in log.get("ocsStats", [])),
         "fctCount": len(fct),
         "maxFctNs": max([x.get("fct_ns", 0) for x in fct], default=0),
+        "rnicGateMode": config.get("rnicGateMode", "-"),
     }
 
     if schedule.get("mode") == "map":

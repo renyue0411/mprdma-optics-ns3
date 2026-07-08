@@ -111,6 +111,7 @@ function renderBadges(exp) {
     <span class="badge">Flow: ${s.flowCount ?? 0}</span>
     <span class="badge">OCS Mode: ${escapeHtml(s.ocsMode || '-')}</span>
     <span class="badge">CC Method: ${escapeHtml(s.ccName || '-')}</span>
+    <span class="badge">RNIC gate: ${escapeHtml(s.rnicGateMode || '-')}</span>
   `;
 }
 function buildAdjacency(topology) {
@@ -1448,6 +1449,14 @@ function renderOcsStats(exp) {
 }
 
 function renderInjectionTable(exp) {
+  const s = exp.summary || {};
+
+  if (s.rnicGateMode === 'disabled') {
+    document.getElementById('injectionTable').innerHTML =
+      '<p class="muted">Default RDMA mode: RNIC injection gate is disabled.</p>';
+    return;
+  }
+
   const tables = (exp.log && exp.log.injectionTables) || [];
 
   const rows = tables.flatMap(t => (t.windows || []).map(w => ({
