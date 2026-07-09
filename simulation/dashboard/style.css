@@ -155,7 +155,6 @@ input[type="search"] {
 .grid {
   display: grid;
   gap: 18px;
-  margin-bottom: 18px;
 }
 
 .two-col {
@@ -201,6 +200,14 @@ input[type="search"] {
 .badge.bad {
   background: #f9d6d6;
   color: #9b3636;
+}
+
+.content > section {
+  margin-bottom: 18px;
+}
+
+.content > section:last-child {
+  margin-bottom: 0;
 }
 
 /* =========================

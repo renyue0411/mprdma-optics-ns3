@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RDMA Support for Reconfigurable Optical Network</title>
+  <title>RDMA/OCS Experiment Platform</title>
   <link rel="icon" type="image/png" href="assets/logo.png" />
   <link rel="shortcut icon" type="image/png" href="assets/logo.png" />
   <link rel="apple-touch-icon" href="assets/logo.png" />
@@ -58,7 +58,7 @@
 
       <section class="card">
         <div class="card-header">
-          <h3>Flow Results</h3>
+          <h3>Flow Summary and Performance</h3>
         </div>
         <div id="flowResultTable" class="table-wrap wide-table"></div>
       </section>
@@ -69,9 +69,16 @@
           <div id="ocsStatsTable" class="table-wrap"></div>
         </div>
         <div class="card">
-          <div class="card-header"><h3>RDMA Injection Table</h3></div>
+          <div class="card-header"><h3>RDMA Injection Window Table</h3></div>
           <div id="injectionTable" class="table-wrap"></div>
         </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h3>RNIC Retransmission Statistics</h3>
+        </div>
+        <div id="rnicRetxTable" class="table-wrap"></div>
       </section>
     </main>
   </div>

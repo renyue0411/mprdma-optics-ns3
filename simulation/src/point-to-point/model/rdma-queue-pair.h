@@ -19,6 +19,13 @@ public:
 	uint16_t sport, dport;
 	uint64_t m_size;
 	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
+	
+	// Retransmission statistics
+	uint64_t m_maxSeqSent = 0;      // highest byte sequence ever generated
+	uint64_t m_retxPackets = 0;     // number of retransmitted DATA packets
+	uint64_t m_retxBytes = 0;       // retransmitted DATA payload bytes
+	uint64_t m_recoverEvents = 0;   // number of recovery/rollback events
+
 	uint16_t m_pg;
 	uint16_t m_ipid;
 	uint32_t m_win; // bound of on-the-fly packets

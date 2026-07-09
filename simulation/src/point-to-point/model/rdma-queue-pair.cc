@@ -41,6 +41,12 @@ namespace ns3
 		m_var_win = false;
 		m_rate = 0;
 		m_nextAvail = Time(0);
+
+		m_maxSeqSent = 0;
+		m_retxPackets = 0;
+		m_retxBytes = 0;
+		m_recoverEvents = 0;
+		
 		mlx.m_alpha = 1;
 		mlx.m_alpha_cnp_arrived = false;
 		mlx.m_first_cnp = true;

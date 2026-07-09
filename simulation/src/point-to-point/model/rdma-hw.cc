@@ -815,6 +815,30 @@ namespace
 
 	void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp)
 	{
+		uint64_t oldSndNxt = qp->snd_nxt;
+		uint64_t oldSndUna = qp->snd_una;
+
+		if (oldSndNxt > oldSndUna)
+		{
+			qp->m_recoverEvents++;
+
+			uint32_t srcNodeId = (qp->sip.Get() >> 8) & 0xffff;
+			uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+
+			std::cout << "[RNIC RECOVER]"
+					<< " t=" << Simulator::Now().GetTimeStep()
+					<< " rnic=" << m_node->GetId()
+					<< " src=" << srcNodeId
+					<< " dst=" << dstNodeId
+					<< " sport=" << qp->sport
+					<< " dport=" << qp->dport
+					<< " pg=" << qp->m_pg
+					<< " old_snd_nxt=" << oldSndNxt
+					<< " snd_una=" << oldSndUna
+					<< " recover_events=" << qp->m_recoverEvents
+					<< std::endl;
+		}
+
 		qp->snd_nxt = qp->snd_una;
 	}
 
@@ -833,6 +857,24 @@ namespace
 		m_qpCompleteCallback(qp);
 
 		qp->m_notifyAppFinish();
+
+		{
+			uint32_t srcNodeId = (qp->sip.Get() >> 8) & 0xffff;
+			uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+
+			std::cout << "[RNIC RETX SUMMARY]"
+					<< " t=" << Simulator::Now().GetTimeStep()
+					<< " rnic=" << m_node->GetId()
+					<< " src=" << srcNodeId
+					<< " dst=" << dstNodeId
+					<< " sport=" << qp->sport
+					<< " dport=" << qp->dport
+					<< " pg=" << qp->m_pg
+					<< " recover_events=" << qp->m_recoverEvents
+					<< " retx_packets=" << qp->m_retxPackets
+					<< " retx_bytes=" << qp->m_retxBytes
+					<< std::endl;
+		}
 
 		// delete the qp
 		DeleteQueuePair(qp);
@@ -883,38 +925,70 @@ namespace
 	{
 		uint32_t payload_size = qp->GetBytesLeft();
 		if (m_mtu < payload_size)
+		{
 			payload_size = m_mtu;
+		}
+
+		uint64_t seq = qp->snd_nxt;
+		bool isRetx = seq < qp->m_maxSeqSent;
+
+		if (isRetx)
+		{
+			qp->m_retxPackets++;
+			qp->m_retxBytes += payload_size;
+
+			uint32_t srcNodeId = (qp->sip.Get() >> 8) & 0xffff;
+			uint32_t dstNodeId = (qp->dip.Get() >> 8) & 0xffff;
+
+			std::cout << "[RNIC RETX]"
+					<< " t=" << Simulator::Now().GetTimeStep()
+					<< " rnic=" << m_node->GetId()
+					<< " src=" << srcNodeId
+					<< " dst=" << dstNodeId
+					<< " sport=" << qp->sport
+					<< " dport=" << qp->dport
+					<< " pg=" << qp->m_pg
+					<< " seq=" << seq
+					<< " bytes=" << payload_size
+					<< " retx_packets=" << qp->m_retxPackets
+					<< " retx_bytes=" << qp->m_retxBytes
+					<< std::endl;
+		}
+
 		Ptr<Packet> p = Create<Packet>(payload_size);
-		// add SeqTsHeader to store sequence information and a timestamp.
+
 		SeqTsHeader seqTs;
-		seqTs.SetSeq(qp->snd_nxt);
+		seqTs.SetSeq(seq);
 		seqTs.SetPG(qp->m_pg);
 		p->AddHeader(seqTs);
-		// add udp header
+
 		UdpHeader udpHeader;
-		udpHeader.SetDestinationPort(qp->dport); // destination port
-		udpHeader.SetSourcePort(qp->sport);		 // source
+		udpHeader.SetDestinationPort(qp->dport);
+		udpHeader.SetSourcePort(qp->sport);
 		p->AddHeader(udpHeader);
-		// add ipv4 header
+
 		Ipv4Header ipHeader;
-		ipHeader.SetSource(qp->sip);			// source IP addresses
-		ipHeader.SetDestination(qp->dip);		// destination IP addresses
-		ipHeader.SetProtocol(0x11);				// protocol type (UDP)
-		ipHeader.SetPayloadSize(p->GetSize());	// payload size
-		ipHeader.SetTtl(64);					// TTL
-		ipHeader.SetTos(0);						// Type of Service (Tos)
-		ipHeader.SetIdentification(qp->m_ipid); // identification
+		ipHeader.SetSource(qp->sip);
+		ipHeader.SetDestination(qp->dip);
+		ipHeader.SetProtocol(0x11);
+		ipHeader.SetPayloadSize(p->GetSize());
+		ipHeader.SetTtl(64);
+		ipHeader.SetTos(0);
+		ipHeader.SetIdentification(qp->m_ipid);
 		p->AddHeader(ipHeader);
-		// add ppp header
+
 		PppHeader ppp;
-		ppp.SetProtocol(0x0021); // EtherToPpp(0x800), see point-to-point-net-device.cc
+		ppp.SetProtocol(0x0021);
 		p->AddHeader(ppp);
 
-		// update state
 		qp->snd_nxt += payload_size;
 		qp->m_ipid++;
 
-		// return
+		if (qp->snd_nxt > qp->m_maxSeqSent)
+		{
+			qp->m_maxSeqSent = qp->snd_nxt;
+		}
+
 		return p;
 	}
 

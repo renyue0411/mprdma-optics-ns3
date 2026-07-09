@@ -14,6 +14,11 @@ function fmtNs(ns) {
   return `${ns} ns`;
 }
 
+function fmtBytes(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return '-';
+  return `${Math.round(v).toLocaleString()} B`;
+}
+
 function fmtGbps(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return '-';
   return `${v.toFixed(3)} Gbps`;
@@ -99,6 +104,7 @@ function renderExperiment() {
   renderFlowResultTable(exp);
   renderOcsStats(exp);
   renderInjectionTable(exp);
+  renderRnicRetxTable(exp);
 }
 
 function renderBadges(exp) {
@@ -111,7 +117,7 @@ function renderBadges(exp) {
     <span class="badge">Flow: ${s.flowCount ?? 0}</span>
     <span class="badge">OCS Mode: ${escapeHtml(s.ocsMode || '-')}</span>
     <span class="badge">CC Method: ${escapeHtml(s.ccName || '-')}</span>
-    <span class="badge">RNIC gate: ${escapeHtml(s.rnicGateMode || '-')}</span>
+    <span class="badge">RNIC Control: ${escapeHtml(s.rnicGateMode || '-')}</span>
   `;
 }
 function buildAdjacency(topology) {
@@ -1426,7 +1432,7 @@ function renderFlowResultTable(exp) {
     {key: 'src', label: 'src'},
     {key: 'dst', label: 'dst'},
     {key: 'dport', label: 'dport'},
-    {key: 'size_bytes', label: 'size'},
+    {key: 'size_bytes', label: 'size', format: fmtBytes},
     {key: 'start_ns', label: 'start', format: fmtNs},
     {key: 'status', label: 'status', format: fmtStatus, html: true},
     {key: 'fct_ns', label: 'FCT', format: fmtOptionalNs},
@@ -1443,8 +1449,8 @@ function renderOcsStats(exp) {
     {key: 'node', label: 'OCS'},
     {key: 'forwardedPackets', label: 'fwd pkts'},
     {key: 'forwardedBytes', label: 'fwd bytes'},
-    {key: 'dropSwitching', label: 'drop switching'},
-    {key: 'dropNoCircuit', label: 'drop no circuit'}
+    {key: 'dropSwitching', label: 'switching drops'},
+    {key: 'dropNoCircuit', label: 'no circuit drops'}
   ], rows);
 }
 
@@ -1473,6 +1479,18 @@ function renderInjectionTable(exp) {
     {key: 'startNs', label: 'start', format: fmtNs},
     {key: 'endNs', label: 'end', format: fmtNs},
     {key: 'dsts', label: 'dst RNICs'}
+  ], rows);
+}
+
+function renderRnicRetxTable(exp) {
+  const rows = (exp.log && exp.log.rnicRetxByRnic) || [];
+
+  renderTable('rnicRetxTable', [
+    {key: 'rnic', label: 'RNIC'},
+    {key: 'flows', label: 'flows'},
+    {key: 'recoverEvents', label: 'recover events'},
+    {key: 'retxPackets', label: 'retx packets'},
+    {key: 'retxBytes', label: 'retx bytes'}
   ], rows);
 }
 

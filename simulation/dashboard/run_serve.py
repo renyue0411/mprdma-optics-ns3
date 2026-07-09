@@ -558,6 +558,7 @@ def parse_run_log(path: Path):
     injection_tables = []
     current_table = None
     flow_bytes = []
+    rnic_retx = []
 
     if not path.exists():
         return {
@@ -610,6 +611,20 @@ def parse_run_log(path: Path):
         r".*?dport=(\d+)"
         r".*?pg=(\d+)"
         r".*?(?:payload_bytes|bytes)=(\d+)"
+    )
+
+    re_rnic_retx_summary = re.compile(
+        r"\[RNIC RETX SUMMARY\].*?"
+        r"t=(\d+).*?"
+        r"rnic=(\d+).*?"
+        r"src=(\d+).*?"
+        r"dst=(\d+).*?"
+        r"sport=(\d+).*?"
+        r"dport=(\d+).*?"
+        r"pg=(\d+).*?"
+        r"recover_events=(\d+).*?"
+        r"retx_packets=(\d+).*?"
+        r"retx_bytes=(\d+)"
     )
 
     for line in path.read_text(errors="ignore").splitlines():
@@ -694,6 +709,22 @@ def parse_run_log(path: Path):
                 "flowId": int(m.group(2)),
                 "bytes": int(m.group(3)),
             })
+            continue
+
+        m = re_rnic_retx_summary.search(line)
+        if m:
+            rnic_retx.append({
+                "timeNs": int(m.group(1)),
+                "rnic": int(m.group(2)),
+                "src": int(m.group(3)),
+                "dst": int(m.group(4)),
+                "sport": int(m.group(5)),
+                "dport": int(m.group(6)),
+                "pg": int(m.group(7)),
+                "recoverEvents": int(m.group(8)),
+                "retxPackets": int(m.group(9)),
+                "retxBytes": int(m.group(10)),
+            })
 
     return {
         "ocsStats": stats,
@@ -701,8 +732,31 @@ def parse_run_log(path: Path):
         "drops": drops,
         "injectionTables": injection_tables,
         "flowBytes": flow_bytes,
+        "rnicRetx": rnic_retx,
+        "rnicRetxByRnic": aggregate_rnic_retx(rnic_retx),
     }
 
+def aggregate_rnic_retx(rnic_retx):
+    agg = {}
+
+    for x in rnic_retx:
+        rnic = x.get("rnic")
+
+        if rnic not in agg:
+            agg[rnic] = {
+                "rnic": rnic,
+                "recoverEvents": 0,
+                "retxPackets": 0,
+                "retxBytes": 0,
+                "flows": 0,
+            }
+
+        agg[rnic]["recoverEvents"] += x.get("recoverEvents", 0)
+        agg[rnic]["retxPackets"] += x.get("retxPackets", 0)
+        agg[rnic]["retxBytes"] += x.get("retxBytes", 0)
+        agg[rnic]["flows"] += 1
+
+    return sorted(agg.values(), key=lambda x: x["rnic"])
 
 def _flow_tuple_key(src, dst, sport, dport, pg):
     return (int(src), int(dst), int(sport), int(dport), int(pg))
@@ -924,6 +978,12 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
 
     rnic_count = len(topology.get("rnics", []))
 
+    rnic_retx_by_rnic = log.get("rnicRetxByRnic", [])
+
+    total_retx_packets = sum(x.get("retxPackets", 0) for x in rnic_retx_by_rnic)
+    total_retx_bytes = sum(x.get("retxBytes", 0) for x in rnic_retx_by_rnic)
+    total_recover_events = sum(x.get("recoverEvents", 0) for x in rnic_retx_by_rnic)
+
     summary = {
         "nodeCount": rnic_count,
         "totalNodeCount": topology.get("totalNodes", 0),
@@ -937,6 +997,9 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
         "fctCount": len(fct),
         "maxFctNs": max([x.get("fct_ns", 0) for x in fct], default=0),
         "rnicGateMode": config.get("rnicGateMode", "-"),
+        "totalRecoverEvents": total_recover_events,
+        "totalRetxPackets": total_retx_packets,
+        "totalRetxBytes": total_retx_bytes,
     }
 
     if schedule.get("mode") == "map":
