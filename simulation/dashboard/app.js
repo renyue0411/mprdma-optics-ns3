@@ -1281,10 +1281,11 @@ function renderThroughput(exp) {
   const plotW = w - m.l - m.r;
   const plotH = h - m.t - m.b;
 
+  const domainMin = normalize ? minT : 0;
+  const domainMax = maxT;
+
   const x = t => {
-    const xValue = normalize ? t - minT : t;
-    const xMin = normalize ? 0 : minT;
-    return m.l + (xValue - xMin) / Math.max(1, maxT - minT) * plotW;
+    return m.l + (t - domainMin) / Math.max(1, domainMax - domainMin) * plotW;
   };
 
   const y = v => {
@@ -1303,8 +1304,8 @@ function renderThroughput(exp) {
 
   for (let i = 0; i <= 5; i++) {
     const xx = m.l + i / 5 * plotW;
-    const val = minT + i / 5 * (maxT - minT);
-    const labelNs = normalize ? i / 5 * (maxT - minT) : val;
+    const tickTimeNs = domainMin + i / 5 * (domainMax - domainMin);
+    const labelNs = normalize ? tickTimeNs - minT : tickTimeNs;
 
     grid.push(`<line class="gridline" x1="${xx}" y1="${m.t}" x2="${xx}" y2="${h - m.b}"/>`);
     grid.push(`<text class="axis-label" x="${xx}" y="${h - 18}" text-anchor="middle">${fmtNs(Math.round(labelNs))}</text>`);
@@ -1330,23 +1331,30 @@ function renderThroughput(exp) {
     if (!points || !points.length) return '';
 
     const sorted = points.slice().sort((a, b) => a.timeNs - b.timeNs);
-    const first = sorted[0];
-    const last = sorted[sorted.length - 1];
-    const endTime = last.timeNs + (bucketNs || inferBucketNs(sorted));
+    const b = bucketNs || inferBucketNs(sorted);
 
-    // Anchor every series on the x-axis, then step up/down at bucket
-    // boundaries. This prevents the line from visually starting or ending
-    // in the middle of the plot when the first/last bucket has non-zero bytes.
+    const first = sorted[0];
+
     let d = `M ${x(first.timeNs).toFixed(1)} ${y(0).toFixed(1)}`;
     d += ` V ${y(first.throughputGbps || 0).toFixed(1)}`;
 
     for (let i = 1; i < sorted.length; i++) {
       const prev = sorted[i - 1];
       const cur = sorted[i];
-      const cx = x(cur.timeNs).toFixed(1);
-      const cy = y(cur.throughputGbps || 0).toFixed(1);
-      d += ` H ${cx} V ${cy}`;
+
+      const prevEnd = prev.timeNs + b;
+
+      // If there is a missing bucket, drop to zero during the gap.
+      if (cur.timeNs > prevEnd + b * 0.5) {
+        d += ` H ${x(prevEnd).toFixed(1)} V ${y(0).toFixed(1)}`;
+        d += ` H ${x(cur.timeNs).toFixed(1)} V ${y(cur.throughputGbps || 0).toFixed(1)}`;
+      } else {
+        d += ` H ${x(cur.timeNs).toFixed(1)} V ${y(cur.throughputGbps || 0).toFixed(1)}`;
+      }
     }
+
+    const last = sorted[sorted.length - 1];
+    const endTime = last.timeNs + b;
 
     d += ` H ${x(endTime).toFixed(1)} V ${y(0).toFixed(1)}`;
 
