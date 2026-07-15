@@ -33,6 +33,7 @@ def build(bld):
         'model/mp-switch-node.cc',
         'model/ocs-node.cc',
         'model/rdma-userspace-transport.cc',
+        'model/rdma-multipath-transport.cc',
         'model/rdma-ocs-controller.cc',
         ]
 
@@ -75,6 +76,7 @@ def build(bld):
         'model/mp-switch-node.h',
         'model/ocs-node.h',
         'model/rdma-userspace-transport.h',
+        'model/rdma-multipath-transport.h',
         'model/rdma-ocs-controller.h',
         ]
 

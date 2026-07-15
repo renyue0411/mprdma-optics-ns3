@@ -1,0 +1,16 @@
+3 0 3 6
+0 1 2
+6-0-0 0 0 50Gbps 0.001ms 0
+7-0-0 0 1 50Gbps 0.001ms 0
+6-0-1 1 0 50Gbps 0.001ms 0
+7-0-1 1 1 50Gbps 0.001ms 0
+0 2 2 0 50Gbps 0.001ms 0
+1 2 2 1 50Gbps 0.001ms 0
+
+
+
+First line: total node #, switch node #, ocs node #, link #
+Second line: switch node IDs...
+Third line: ocs node IDs...
+src dst [src_ocs_port_if_src_is_ocs] [dst_ocs_port_if_dst_is_ocs] rate delay error
+...

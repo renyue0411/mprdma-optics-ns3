@@ -1,0 +1,23 @@
+# CONFIG ocs_id epoch_start_us slice_duration_us switching_time_us num_slices
+CONFIG 0 0 10000 10 3
+CONFIG 1 0 10000 10 3
+CONFIG 2 0 10000 0 1
+
+# ocs_id slice logical_port_a logical_port_b
+
+# slice 0: same-plane direct
+0 0 0 1
+1 0 0 1
+
+# slice 1: cross-plane 6-0-0 -> 7-0-1
+# path: 6-0-0 -- OCS0(port0-port2) -- OCS2 -- OCS1(port2-port1) -- 7-0-1
+0 1 0 2
+1 1 1 2
+
+# slice 2: cross-plane 6-0-1 -> 7-0-0
+# path: 6-0-1 -- OCS1(port0-port2) -- OCS2 -- OCS0(port2-port1) -- 7-0-0
+0 2 1 2
+1 2 0 2
+
+# OCS2 is always connected
+2 0 0 1

@@ -41,6 +41,7 @@
 #include <ns3/rdma-driver.h>
 #include <ns3/switch-node.h>
 #include <ns3/sim-setting.h>
+#include <ns3/rdma-multipath-transport.h>
 
 // OCS node
 #include "ns3/ocs-node.h"
@@ -130,6 +131,7 @@ unordered_map<uint64_t, double> rate2pmax;
 std::ifstream topof, flowf, tracef;
 
 NodeContainer n;
+RdmaMultipathTransport rdmaMultipathTransport;
 
 uint64_t nic_rate;
 
@@ -160,24 +162,52 @@ std::unordered_map<uint32_t, unordered_map<uint32_t, uint16_t>> portNumder;
 
 struct FlowInput
 {
-	uint32_t src, dst, pg, maxPacketCount, port, dport;
-	double start_time;
-	uint32_t idx;
+    FlowInput()
+        : srcToken(""),
+          dstToken(""),
+          src(0),
+          dst(0),
+          pg(0),
+          maxPacketCount(0),
+          port(0),
+          dport(0),
+          start_time(0.0),
+          idx(0)
+    {
+    }
+
+    std::string srcToken;
+    std::string dstToken;
+
+    uint32_t src;
+    uint32_t dst;
+    uint32_t pg;
+    uint32_t maxPacketCount;
+    uint32_t port;
+    uint32_t dport;
+
+    double start_time;
+    uint32_t idx;
 };
-FlowInput flow_input = {0};
+
+FlowInput flow_input;
 uint32_t flow_num;
 
 void ReadFlowInput()
 {
 	if (flow_input.idx < flow_num)
 	{
-		flowf >> flow_input.src >> flow_input.dst >> flow_input.pg
+		flowf >> flow_input.srcToken >> flow_input.dstToken >> flow_input.pg
 		      >> flow_input.dport >> flow_input.maxPacketCount
 		      >> flow_input.start_time;
-		NS_ASSERT_MSG(flow_input.src < n.GetN(), "flow src node id out of range");
-		NS_ASSERT_MSG(flow_input.dst < n.GetN(), "flow dst node id out of range");
-		NS_ASSERT_MSG(n.Get(flow_input.src)->GetNodeType() == 0, "flow src is not host");
-		NS_ASSERT_MSG(n.Get(flow_input.dst)->GetNodeType() == 0, "flow dst is not host");
+		RdmaMultipathTransport::ScheduledFlow scheduled =
+			rdmaMultipathTransport.ScheduleFlow(flow_input.srcToken, flow_input.dstToken);
+		flow_input.src = scheduled.srcCarrierNodeId;
+		flow_input.dst = scheduled.dstCarrierNodeId;
+		NS_ASSERT_MSG(flow_input.src < n.GetN(), "scheduled flow src carrier node id out of range");
+		NS_ASSERT_MSG(flow_input.dst < n.GetN(), "scheduled flow dst carrier node id out of range");
+		NS_ASSERT_MSG(n.Get(flow_input.src)->GetNodeType() == 0, "scheduled flow src is not host");
+		NS_ASSERT_MSG(n.Get(flow_input.dst)->GetNodeType() == 0, "scheduled flow dst is not host");
 	}
 }
 void ScheduleFlowInputs()
@@ -475,6 +505,95 @@ ParseDoubleToken(const std::string &token, const std::string &line)
 	double value = std::strtod(token.c_str(), &end);
 	NS_ASSERT_MSG(end != token.c_str() && *end == '\0', "Invalid double token '" << token << "' in topology line: " << line);
 	return value;
+}
+
+
+struct RawTopologyLink
+{
+	std::string line;
+	std::vector<std::string> tokens;
+};
+
+static bool
+IsNumericNodeToken(const std::string &token)
+{
+	return RdmaMultipathTransport::IsUnsignedIntegerToken(token);
+}
+
+static bool
+IsExplicitEndpointNodeToken(const std::string &token)
+{
+	return RdmaMultipathTransport::IsExplicitEndpointToken(token);
+}
+
+static bool
+IsOcsToken(const std::string &token,
+           const std::vector<uint32_t> &node_type,
+           uint32_t base_node_num)
+{
+	if (!IsNumericNodeToken(token))
+	{
+		return false;
+	}
+	uint32_t nodeId = ParseUint32Token(token, token);
+	return nodeId < base_node_num && node_type[nodeId] == 2;
+}
+
+static bool
+IsSwitchToken(const std::string &token,
+              const std::vector<uint32_t> &node_type,
+              uint32_t base_node_num)
+{
+	if (!IsNumericNodeToken(token))
+	{
+		return false;
+	}
+	uint32_t nodeId = ParseUint32Token(token, token);
+	return nodeId < base_node_num && node_type[nodeId] == 1;
+}
+
+static bool
+IsInfrastructureToken(const std::string &token,
+                      const std::vector<uint32_t> &node_type,
+                      uint32_t base_node_num)
+{
+	return IsSwitchToken(token, node_type, base_node_num) ||
+	       IsOcsToken(token, node_type, base_node_num);
+}
+
+static bool
+IsEndpointPositionToken(const std::string &token,
+                        const std::vector<uint32_t> &node_type,
+                        uint32_t base_node_num)
+{
+	if (IsExplicitEndpointNodeToken(token))
+	{
+		return true;
+	}
+	if (!IsNumericNodeToken(token))
+	{
+		return false;
+	}
+	uint32_t nodeId = ParseUint32Token(token, token);
+	if (nodeId >= base_node_num)
+	{
+		return true;
+	}
+	return node_type[nodeId] == 0;
+}
+
+static uint32_t
+ResolveTopologyNodeToken(const std::string &token,
+                         uint32_t base_node_num)
+{
+	if (rdmaMultipathTransport.HasEndpointToken(token))
+	{
+		return rdmaMultipathTransport.GetCarrierNodeForToken(token);
+	}
+	uint32_t nodeId = ParseUint32Token(token, token);
+	NS_ASSERT_MSG(nodeId < base_node_num,
+		"numeric infrastructure/base node token " << token << " is out of base range");
+	return nodeId;
 }
 
 int main(int argc, char *argv[])
@@ -1027,6 +1146,86 @@ int main(int argc, char *argv[])
 		topof.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 	}
 
+	// Multipath/multiplane topology parsing uses two passes.  The first pass
+	// records link lines and registers host endpoint tokens:
+	//   N     : logicalNode N single endpoint
+	//   N-R-P : logicalNode N, RNICGroup R, plane P endpoint
+	// Numeric switch / OCS tokens remain infrastructure nodes.  Explicit
+	// N-R-P endpoints and numeric endpoints outside the base node namespace are
+	// assigned carrier RNIC node IDs automatically.
+	const uint32_t base_node_num = node_num;
+	uint32_t next_carrier_node_id = base_node_num;
+	std::vector<RawTopologyLink> rawLinks;
+	rawLinks.reserve(link_num);
+
+	for (uint32_t i = 0; i < link_num; i++)
+	{
+		std::string linkLine;
+		std::vector<std::string> tokens;
+		while (std::getline(topof, linkLine))
+		{
+			if (StartsWithCommentOrBlank(linkLine))
+			{
+				continue;
+			}
+			tokens = TokenizeLine(linkLine);
+			if (!tokens.empty())
+			{
+				break;
+			}
+		}
+		NS_ASSERT_MSG(!tokens.empty(), "Unexpected end of topology file while reading link " << i);
+		NS_ASSERT_MSG(tokens.size() >= 2, "Invalid topology link line: expected at least src and dst: " << linkLine);
+
+		for (uint32_t endpointIdx = 0; endpointIdx < 2; endpointIdx++)
+		{
+			const std::string &tok = tokens[endpointIdx];
+			if (!IsEndpointPositionToken(tok, node_type, base_node_num))
+			{
+				continue;
+			}
+
+			if (rdmaMultipathTransport.HasEndpointToken(tok))
+			{
+				continue;
+			}
+
+			bool explicitEndpoint = IsExplicitEndpointNodeToken(tok);
+			uint32_t carrier = 0;
+			if (!explicitEndpoint && IsNumericNodeToken(tok))
+			{
+				uint32_t nodeId = ParseUint32Token(tok, linkLine);
+				if (nodeId < base_node_num)
+				{
+					NS_ASSERT_MSG(node_type[nodeId] == 0,
+						"numeric topology endpoint " << tok << " is not a host node");
+					carrier = nodeId;
+				}
+				else
+				{
+					carrier = next_carrier_node_id++;
+				}
+			}
+			else
+			{
+				carrier = next_carrier_node_id++;
+			}
+
+			rdmaMultipathTransport.RegisterTopologyEndpoint(tok, carrier, explicitEndpoint);
+		}
+
+		RawTopologyLink raw;
+		raw.line = linkLine;
+		raw.tokens = tokens;
+		rawLinks.push_back(raw);
+	}
+
+	node_num = next_carrier_node_id;
+	node_type.resize(node_num, 0);
+	std::cout << "TOPOLOGY_BASE_NODES\t\t" << base_node_num << "\n";
+	std::cout << "TOPOLOGY_NODES_FINAL\t\t" << node_num << "\n";
+	rdmaMultipathTransport.DumpEndpoints(std::cout);
+
 	for (uint32_t i = 0; i < node_num; i++)
 	{
 		if (node_type[i] == 2)
@@ -1109,27 +1308,15 @@ int main(int argc, char *argv[])
 		std::string data_rate, link_delay;
 		double error_rate = 0.0;
 
-		std::string linkLine;
-		std::vector<std::string> tokens;
-		while (std::getline(topof, linkLine))
-		{
-			if (StartsWithCommentOrBlank(linkLine))
-			{
-				continue;
-			}
-			tokens = TokenizeLine(linkLine);
-			if (!tokens.empty())
-			{
-				break;
-			}
-		}
-		NS_ASSERT_MSG(!tokens.empty(), "Unexpected end of topology file while reading link " << i);
+		NS_ASSERT_MSG(i < rawLinks.size(), "raw topology link index out of range");
+		std::string linkLine = rawLinks[i].line;
+		std::vector<std::string> tokens = rawLinks[i].tokens;
 		NS_ASSERT_MSG(tokens.size() >= 2, "Invalid topology link line: expected at least src and dst: " << linkLine);
 
-		src = ParseUint32Token(tokens[0], linkLine);
-		dst = ParseUint32Token(tokens[1], linkLine);
-		NS_ASSERT_MSG(src < node_num, "link src node id out of range in topology line: " << linkLine);
-		NS_ASSERT_MSG(dst < node_num, "link dst node id out of range in topology line: " << linkLine);
+		src = ResolveTopologyNodeToken(tokens[0], base_node_num);
+		dst = ResolveTopologyNodeToken(tokens[1], base_node_num);
+		NS_ASSERT_MSG(src < node_num, "resolved link src node id out of range in topology line: " << linkLine);
+		NS_ASSERT_MSG(dst < node_num, "resolved link dst node id out of range in topology line: " << linkLine);
 
 		if (!topology_has_logical_ports) {
 			// Legacy format:
@@ -1456,6 +1643,12 @@ int main(int argc, char *argv[])
 		{
 			if (n.Get(j)->GetNodeType() != 0)
 				continue;
+			if (pairDelay[n.Get(i)].find(n.Get(j)) == pairDelay[n.Get(i)].end())
+				continue;
+			if (pairTxDelay[n.Get(i)].find(n.Get(j)) == pairTxDelay[n.Get(i)].end())
+				continue;
+			if (pairBw[i].find(j) == pairBw[i].end())
+				continue;
 			uint64_t delay = pairDelay[n.Get(i)][n.Get(j)];
 			uint64_t txDelay = pairTxDelay[n.Get(i)][n.Get(j)];
 			uint64_t rtt = delay * 2 + txDelay;
@@ -1470,6 +1663,27 @@ int main(int argc, char *argv[])
 		}
 	}
 	printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
+
+	// Export host-to-host route costs to the MPQUIC-like RDMA multipath
+	// transport layer. The transport layer uses these costs only for endpoint
+	// binding before creating a concrete RDMA flow; packet forwarding remains in
+	// the existing RDMA/switch forwarding tables.
+	rdmaMultipathTransport.ClearRouteCosts();
+	for (uint32_t i = 0; i < node_num; i++)
+	{
+		if (n.Get(i)->GetNodeType() != 0)
+			continue;
+		for (uint32_t j = 0; j < node_num; j++)
+		{
+			if (n.Get(j)->GetNodeType() != 0)
+				continue;
+			if (pairDelay[n.Get(i)].find(n.Get(j)) == pairDelay[n.Get(i)].end())
+				continue;
+			uint64_t cost = pairDelay[n.Get(i)][n.Get(j)] + pairTxDelay[n.Get(i)][n.Get(j)];
+			rdmaMultipathTransport.AddRouteCost(i, j, cost);
+		}
+	}
+
 
 	//
 	// setup switch CC
