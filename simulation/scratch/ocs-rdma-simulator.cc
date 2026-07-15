@@ -76,6 +76,9 @@ uint32_t ocs_schedule_enable = 0;
 std::string ocs_schedule_file = "";
 uint32_t rnic_gate_enable = 1;
 
+uint64_t userspace_wr_chunk_bytes = 16 * 1024;
+uint64_t userspace_max_outstanding_bytes = 64 * 1024;
+
 // Topology link format.
 //   auto: 3-field header uses legacy links; 4-field header auto-detects
 //         full with_ocs_ports vs compact_ocs_ports per link line.
@@ -1382,15 +1385,53 @@ int main(int argc, char *argv[])
 
 			node->AggregateObject(rdma);
 			rdma->Init();
-			rdma->TraceConnectWithoutContext("QpComplete", MakeBoundCallback(qp_finish, fct_output));
+
+			rdma->SetInjectionMode(
+				rnic_gate_enable);
+
+			rdma->ConfigureUserspaceTransport(
+				userspace_wr_chunk_bytes,
+				userspace_max_outstanding_bytes);
+
+			rdma->TraceConnectWithoutContext(
+				"QpComplete",
+				MakeBoundCallback(
+					qp_finish,
+					fct_output));
 		}
 	}
 #endif
 
-	if (ocs_schedule_enable && !ocs_node_ids.empty() && rnic_gate_enable) {
-		rdmaOcsController->InstallRnicGateTablesToRdmaHw();
-	} else if (ocs_schedule_enable && !ocs_node_ids.empty() && !rnic_gate_enable) {
-		std::cout << "[RNIC GATE INSTALL SKIP] mode=default_rdma reason=RNIC_GATE_ENABLE_0" << std::endl;
+	if (ocs_schedule_enable &&
+		!ocs_node_ids.empty())
+	{
+		if (rnic_gate_enable == 1)
+		{
+			rdmaOcsController
+				->InstallRnicGateTablesToRdmaHw();
+
+			std::cout
+				<< "[RDMA GATE MODE]"
+				<< " mode=1 layer=rnic"
+				<< std::endl;
+		}
+		else if (rnic_gate_enable == 2)
+		{
+			rdmaOcsController
+				->InstallRnicGateTablesToUserspace();
+
+			std::cout
+				<< "[RDMA GATE MODE]"
+				<< " mode=2 layer=userspace"
+				<< std::endl;
+		}
+		else
+		{
+			std::cout
+				<< "[RDMA GATE MODE]"
+				<< " mode=0 layer=default"
+				<< std::endl;
+		}
 	}
 
 	// set ACK priority on hosts
