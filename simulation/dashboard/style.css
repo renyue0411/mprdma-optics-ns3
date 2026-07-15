@@ -416,8 +416,33 @@ input[type="search"] {
   display: flex;
   align-items: center;
   gap: 6px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
   font-size: 12px;
   color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+
+.legend-item:hover {
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
+.legend-item:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.legend-item.is-hidden {
+  opacity: 0.42;
+}
+
+.legend-item.is-hidden .legend-swatch {
+  background: transparent !important;
+  border: 1px solid currentColor;
 }
 
 .legend-swatch {
@@ -772,3 +797,47 @@ th {
   }
 }
 
+
+/* =========================
+   Logical-node / multiplane endpoint view
+   ========================= */
+
+.logical-node-card {
+  fill: #f7fbfe;
+  stroke: #7fb0d1;
+  stroke-width: 1.8;
+  filter: drop-shadow(0 4px 9px rgba(42, 85, 114, 0.10));
+}
+
+.logical-node-title {
+  fill: #1e2b37;
+  font-size: 11px;
+  font-weight: 850;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+.endpoint-port-dot {
+  fill: #ffffff;
+  stroke: #2f658d;
+  stroke-width: 2;
+}
+
+.endpoint-port-label {
+  fill: #2f658d;
+  font-size: 10px;
+  font-weight: 900;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+.endpoint-token-label {
+  fill: #647789;
+  font-size: 8px;
+  font-weight: 700;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}

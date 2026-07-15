@@ -33,18 +33,27 @@ class Link:
     rate: str
     delay: str
     error: str
+    src_token: Optional[str] = None
+    dst_token: Optional[str] = None
 
 
 @dataclass
 class Flow:
     index: int
-    src: int
-    dst: int
+    src: Optional[int]
+    dst: Optional[int]
     pg: int
     dport: int
     size_bytes: int
     start_s: float
     start_ns: int
+    src_token: str
+    dst_token: str
+    selected_src_token: Optional[str] = None
+    selected_dst_token: Optional[str] = None
+    src_carrier: Optional[int] = None
+    dst_carrier: Optional[int] = None
+    route_cost: Optional[int] = None
 
 
 @dataclass
@@ -95,7 +104,7 @@ def parse_config(path: Path):
     injection_mode_names = {
         0: "Default RDMA",
         1: "RNIC Gate",
-        2: "Userspace Admission",
+        2: "User Space",
     }
 
     injection_layer_names = {
@@ -108,7 +117,7 @@ def parse_config(path: Path):
         "raw": cfg,
         "ccMode": cc_code,
         "ccName": CC_NAMES.get(cc_code, f"UNKNOWN({cc_code})" if cc_code is not None else "-"),
-        "ocsMode": "schedule" if schedule_enable == 1 else ("map" if schedule_enable == 0 else "-"),
+        "ocsMode": "Schedule" if schedule_enable == 1 else ("Map" if schedule_enable == 0 else "-"),
         "rnicGateEnable": rnic_gate_enable,
         "rnicGateMode": "enabled" if rnic_gate_enable == 1 else "disabled",
         "injectionMode": rnic_gate_enable,
@@ -117,55 +126,130 @@ def parse_config(path: Path):
     }
 
 
+
+def parse_endpoint_token(token: str):
+    """Parse N or N-R-P topology tokens.
+
+    Numeric tokens are ordinary numeric nodes. Tokens with three dash-separated
+    integer fields are explicit RDMA plane endpoints. The dashboard mirrors the
+    simulator rule: an explicit endpoint is displayed as a port under its logical
+    node, while internally it is mapped to an auto-created carrier RNIC node.
+    """
+    token = token.strip()
+
+    if re.fullmatch(r"\d+", token):
+        return {
+            "kind": "numeric",
+            "token": token,
+            "node": int(token),
+            "logicalId": int(token),
+            "rnicGroupId": 0,
+            "planeId": 0,
+            "explicit": False,
+        }
+
+    m = re.fullmatch(r"(\d+)-(\d+)-(\d+)", token)
+    if m:
+        return {
+            "kind": "endpoint",
+            "token": token,
+            "node": None,
+            "logicalId": int(m.group(1)),
+            "rnicGroupId": int(m.group(2)),
+            "planeId": int(m.group(3)),
+            "explicit": True,
+        }
+
+    return None
+
+
+def parse_flow_token(token: str):
+    token = token.strip()
+
+    if re.fullmatch(r"\d+", token):
+        return {
+            "kind": "logical",
+            "token": token,
+            "logicalId": int(token),
+            "rnicGroupId": None,
+            "planeId": None,
+            "exact": False,
+        }
+
+    m = re.fullmatch(r"(\d+)-(\d+)$", token)
+    if m:
+        return {
+            "kind": "rnic_group",
+            "token": token,
+            "logicalId": int(m.group(1)),
+            "rnicGroupId": int(m.group(2)),
+            "planeId": None,
+            "exact": False,
+        }
+
+    m = re.fullmatch(r"(\d+)-(\d+)-(\d+)$", token)
+    if m:
+        return {
+            "kind": "endpoint",
+            "token": token,
+            "logicalId": int(m.group(1)),
+            "rnicGroupId": int(m.group(2)),
+            "planeId": int(m.group(3)),
+            "exact": True,
+        }
+
+    return None
+
+
+def endpoint_sort_key(ep):
+    return (
+        ep.get("logicalId", 0),
+        ep.get("rnicGroupId", 0),
+        ep.get("planeId", 0),
+        ep.get("carrierNodeId", 0),
+    )
+
 def parse_topology(path: Path):
     lines = read_lines(path)
 
+    empty = {
+        "nodes": [],
+        "links": [],
+        "switches": [],
+        "ocs": [],
+        "rnics": [],
+        "logicalNodes": [],
+        "endpointMap": {},
+        "carrierToEndpoint": {},
+        "totalNodes": 0,
+        "baseNodeCount": 0,
+        "switchCount": 0,
+        "ocsCount": 0,
+        "linkCount": 0,
+        "ocsPortToNeighbor": {},
+    }
+
     if not lines:
-        return {
-            "nodes": [],
-            "links": [],
-            "switches": [],
-            "ocs": [],
-            "rnics": [],
-            "totalNodes": 0,
-            "switchCount": 0,
-            "ocsCount": 0,
-            "linkCount": 0,
-            "ocsPortToNeighbor": {},
-        }
+        return empty
 
     first = lines[0].split()
 
     if len(first) == 3:
-        # Legacy format:
-        # total_node_num switch_node_num link_num
         total_nodes = int(first[0])
         switch_count = int(first[1])
         ocs_count = 0
         link_count = int(first[2])
         header_mode = "legacy"
     elif len(first) == 4:
-        # OCS-aware format:
-        # total_node_num switch_node_num ocs_node_num link_num
         total_nodes = int(first[0])
         switch_count = int(first[1])
         ocs_count = int(first[2])
         link_count = int(first[3])
         header_mode = "ocs"
     else:
-        return {
-            "nodes": [],
-            "links": [],
-            "switches": [],
-            "ocs": [],
-            "rnics": [],
-            "totalNodes": 0,
-            "switchCount": 0,
-            "ocsCount": 0,
-            "linkCount": 0,
-            "ocsPortToNeighbor": {},
-            "error": f"invalid topology header: {lines[0]}",
-        }
+        out = dict(empty)
+        out["error"] = f"invalid topology header: {lines[0]}"
+        return out
 
     idx = 1
 
@@ -184,7 +268,7 @@ def parse_topology(path: Path):
     switch_set = set(switches)
     ocs_set = set(ocs_nodes)
 
-    nodes = []
+    base_nodes = []
     for nid in range(total_nodes):
         if nid in ocs_set:
             ntype = "ocs"
@@ -193,13 +277,93 @@ def parse_topology(path: Path):
         else:
             ntype = "rnic"
 
-        nodes.append({
+        base_nodes.append({
             "id": nid,
             "type": ntype,
+            "token": str(nid),
         })
 
+    nodes = list(base_nodes)
     links = []
     port_to_neighbor = {}
+    endpoint_map = {}
+    carrier_to_endpoint = {}
+    logical_nodes = {}
+    next_carrier = total_nodes
+
+    def is_ocs_token(token):
+        parsed = parse_endpoint_token(token)
+        return parsed is not None and parsed["kind"] == "numeric" and parsed["node"] in ocs_set
+
+    def resolve_node_token(token: str):
+        nonlocal next_carrier
+
+        parsed = parse_endpoint_token(token)
+        if parsed is None:
+            return None
+
+        if parsed["kind"] == "numeric":
+            nid = parsed["node"]
+            if 0 <= nid < total_nodes:
+                return nid
+
+            # Numeric host outside the base namespace. Treat it as a single
+            # logical endpoint so compact topologies can use base nodes only
+            # for switches/OCS.
+            ep_token = parsed["token"]
+            if ep_token not in endpoint_map:
+                ep = {
+                    "token": ep_token,
+                    "logicalId": parsed["logicalId"],
+                    "rnicGroupId": 0,
+                    "planeId": 0,
+                    "carrierNodeId": next_carrier,
+                    "explicit": False,
+                    "label": "P0",
+                }
+                endpoint_map[ep_token] = ep
+                carrier_to_endpoint[str(next_carrier)] = ep
+                nodes.append({
+                    "id": next_carrier,
+                    "type": "rnic",
+                    "token": ep_token,
+                    "logicalId": ep["logicalId"],
+                    "rnicGroupId": 0,
+                    "planeId": 0,
+                    "explicitEndpoint": False,
+                    "isEndpoint": True,
+                    "label": ep_token,
+                })
+                next_carrier += 1
+            return endpoint_map[ep_token]["carrierNodeId"]
+
+        ep_token = parsed["token"]
+        if ep_token not in endpoint_map:
+            ep = {
+                "token": ep_token,
+                "logicalId": parsed["logicalId"],
+                "rnicGroupId": parsed["rnicGroupId"],
+                "planeId": parsed["planeId"],
+                "carrierNodeId": next_carrier,
+                "explicit": True,
+                "label": f"P{parsed['planeId']}",
+            }
+            endpoint_map[ep_token] = ep
+            carrier_to_endpoint[str(next_carrier)] = ep
+            nodes.append({
+                "id": next_carrier,
+                "type": "rnic",
+                "token": ep_token,
+                "logicalId": ep["logicalId"],
+                "rnicGroupId": ep["rnicGroupId"],
+                "planeId": ep["planeId"],
+                "explicitEndpoint": True,
+                "isEndpoint": True,
+                "label": ep_token,
+            })
+            next_carrier += 1
+
+        return endpoint_map[ep_token]["carrierNodeId"]
 
     for line in lines[idx:idx + link_count]:
         parts = line.split()
@@ -207,19 +371,22 @@ def parse_topology(path: Path):
         if len(parts) < 5:
             continue
 
-        try:
-            src = int(parts[0])
-            dst = int(parts[1])
-        except Exception:
+        src_token = parts[0]
+        dst_token = parts[1]
+        src_is_ocs = is_ocs_token(src_token)
+        dst_is_ocs = is_ocs_token(dst_token)
+
+        src = resolve_node_token(src_token)
+        dst = resolve_node_token(dst_token)
+
+        if src is None or dst is None:
             continue
 
         src_port = None
         dst_port = None
 
         try:
-            if src in ocs_set and dst in ocs_set:
-                # compact_ocs_ports / with_ocs_ports:
-                # src dst src_ocs_port dst_ocs_port rate delay error
+            if src_is_ocs and dst_is_ocs:
                 if len(parts) < 7:
                     continue
 
@@ -227,15 +394,9 @@ def parse_topology(path: Path):
                 dst_port = int(parts[3])
                 rate, delay, err = parts[4], parts[5], parts[6]
 
-            elif src in ocs_set:
-                # compact_ocs_ports:
-                # src dst src_ocs_port rate delay error
-                #
-                # with_ocs_ports, if used:
-                # src dst src_port dst_port rate delay error
+            elif src_is_ocs:
                 if len(parts) >= 7:
                     src_port = int(parts[2])
-                    # dst is not OCS, so dst_port is not needed by dashboard.
                     rate, delay, err = parts[4], parts[5], parts[6]
                 elif len(parts) >= 6:
                     src_port = int(parts[2])
@@ -243,14 +404,8 @@ def parse_topology(path: Path):
                 else:
                     continue
 
-            elif dst in ocs_set:
-                # compact_ocs_ports:
-                # src dst dst_ocs_port rate delay error
-                #
-                # with_ocs_ports, if used:
-                # src dst src_port dst_port rate delay error
+            elif dst_is_ocs:
                 if len(parts) >= 7:
-                    # src is not OCS, so src_port is not needed by dashboard.
                     dst_port = int(parts[3])
                     rate, delay, err = parts[4], parts[5], parts[6]
                 elif len(parts) >= 6:
@@ -260,11 +415,6 @@ def parse_topology(path: Path):
                     continue
 
             else:
-                # Legacy / normal EPS link:
-                # src dst rate delay error
-                #
-                # If a with_ocs_ports-style non-OCS link appears:
-                # src dst src_port dst_port rate delay error
                 if len(parts) >= 7:
                     rate, delay, err = parts[4], parts[5], parts[6]
                 else:
@@ -273,23 +423,43 @@ def parse_topology(path: Path):
         except Exception:
             continue
 
-        link = Link(src, dst, src_port, dst_port, rate, delay, err)
+        link = Link(src, dst, src_port, dst_port, rate, delay, err, src_token, dst_token)
         links.append(asdict(link))
 
         if src in ocs_set and src_port is not None:
             port_to_neighbor[f"{src}:{src_port}"] = {
                 "node": dst,
                 "peer_port": dst_port if dst_port is not None else 0,
+                "token": dst_token,
             }
 
         if dst in ocs_set and dst_port is not None:
             port_to_neighbor[f"{dst}:{dst_port}"] = {
                 "node": src,
                 "peer_port": src_port if src_port is not None else 0,
+                "token": src_token,
             }
 
+    for ep in endpoint_map.values():
+        lid = ep["logicalId"]
+        if lid not in logical_nodes:
+            logical_nodes[lid] = {
+                "logicalId": lid,
+                "type": "host",
+                "label": f"Node {lid}",
+                "endpoints": [],
+            }
+        logical_nodes[lid]["endpoints"].append(ep)
+
+    logical_node_list = []
+    for item in logical_nodes.values():
+        item["endpoints"].sort(key=endpoint_sort_key)
+        logical_node_list.append(item)
+    logical_node_list.sort(key=lambda x: x["logicalId"])
+
     return {
-        "totalNodes": total_nodes,
+        "totalNodes": next_carrier,
+        "baseNodeCount": total_nodes,
         "switchCount": switch_count,
         "ocsCount": ocs_count,
         "linkCount": link_count,
@@ -299,9 +469,11 @@ def parse_topology(path: Path):
         "rnics": [n["id"] for n in nodes if n["type"] == "rnic"],
         "nodes": nodes,
         "links": links,
+        "logicalNodes": logical_node_list,
+        "endpointMap": endpoint_map,
+        "carrierToEndpoint": carrier_to_endpoint,
         "ocsPortToNeighbor": port_to_neighbor,
     }
-
 
 def parse_schedule(path: Path):
     configs = {}
@@ -397,9 +569,12 @@ def parse_flows(path: Path):
         if len(parts) < 6:
             continue
 
+        src_token = parts[0]
+        dst_token = parts[1]
+        src_parsed = parse_flow_token(src_token)
+        dst_parsed = parse_flow_token(dst_token)
+
         try:
-            src = int(parts[0])
-            dst = int(parts[1])
             pg = int(parts[2])
             dport = int(parts[3])
             size = int(parts[4])
@@ -409,17 +584,18 @@ def parse_flows(path: Path):
 
         flows.append(Flow(
             index=len(flows),
-            src=src,
-            dst=dst,
+            src=src_parsed.get("logicalId") if src_parsed else safe_int(src_token, None),
+            dst=dst_parsed.get("logicalId") if dst_parsed else safe_int(dst_token, None),
             pg=pg,
             dport=dport,
             size_bytes=size,
             start_s=start_s,
             start_ns=int(round(start_s * 1_000_000_000)),
+            src_token=src_token,
+            dst_token=dst_token,
         ))
 
     return flows
-
 
 def decode_fct_endpoint(token: str):
     token = token.strip()
@@ -494,6 +670,37 @@ def filter_fct_by_flows(fct_records, flows):
 
     return out
 
+def attach_mpath_schedules_to_flows(flows, schedules):
+    """Attach [MPATH SCHEDULE] records to flow declarations by order.
+
+    The simulator emits one schedule log for each flow after logical tokens are
+    resolved. That is the most reliable way to match token-based flow input to
+    numeric FCT / throughput records.
+    """
+    for f, sched in zip(flows, schedules or []):
+        f.selected_src_token = sched.get("selectedSrc")
+        f.selected_dst_token = sched.get("selectedDst")
+        f.src_carrier = sched.get("srcCarrier")
+        f.dst_carrier = sched.get("dstCarrier")
+        f.route_cost = sched.get("routeCost")
+
+
+def flow_match_src(f):
+    return f.src_carrier if f.src_carrier is not None else f.src
+
+
+def flow_match_dst(f):
+    return f.dst_carrier if f.dst_carrier is not None else f.dst
+
+
+def flow_display_src(f):
+    return f.selected_src_token or f.src_token or str(flow_match_src(f))
+
+
+def flow_display_dst(f):
+    return f.selected_dst_token or f.dst_token or str(flow_match_dst(f))
+
+
 def join_flow_fct_results(fct_records, flows):
     used = set()
     rows = []
@@ -501,14 +708,16 @@ def join_flow_fct_results(fct_records, flows):
     for f in flows:
         best_idx = None
         best_delta = None
+        match_src = flow_match_src(f)
+        match_dst = flow_match_dst(f)
 
         for i, r in enumerate(fct_records):
             if i in used:
                 continue
 
-            if r.src != f.src:
+            if match_src is not None and r.src != match_src:
                 continue
-            if r.dst != f.dst:
+            if match_dst is not None and r.dst != match_dst:
                 continue
             if r.dport != f.dport:
                 continue
@@ -517,24 +726,36 @@ def join_flow_fct_results(fct_records, flows):
 
             delta = abs(r.start_ns - f.start_ns)
 
-            # flow start 间隔通常是 20us，这里只允许 1us 以内的时间误差，避免错误匹配相邻 flow。
             if delta <= 1000:
                 if best_delta is None or delta < best_delta:
                     best_idx = i
                     best_delta = delta
 
+        base = {
+            "index": f.index,
+            "src": match_src,
+            "dst": match_dst,
+            "src_token": f.src_token,
+            "dst_token": f.dst_token,
+            "selected_src_token": f.selected_src_token,
+            "selected_dst_token": f.selected_dst_token,
+            "display_src": flow_display_src(f),
+            "display_dst": flow_display_dst(f),
+            "src_carrier": f.src_carrier,
+            "dst_carrier": f.dst_carrier,
+            "route_cost": f.route_cost,
+            "pg": f.pg,
+            "dport": f.dport,
+            "size_bytes": f.size_bytes,
+            "start_ns": f.start_ns,
+        }
+
         if best_idx is not None:
             used.add(best_idx)
             r = fct_records[best_idx]
 
-            rows.append({
-                "index": f.index,
-                "src": f.src,
-                "dst": f.dst,
-                "pg": f.pg,
-                "dport": f.dport,
-                "size_bytes": f.size_bytes,
-                "start_ns": f.start_ns,
+            row = dict(base)
+            row.update({
                 "status": "completed",
                 "fct_ns": r.fct_ns,
                 "finish_ns": r.finish_ns,
@@ -545,15 +766,10 @@ def join_flow_fct_results(fct_records, flows):
                 "fct_start_ns": r.start_ns,
                 "match_delta_ns": abs(r.start_ns - f.start_ns),
             })
+            rows.append(row)
         else:
-            rows.append({
-                "index": f.index,
-                "src": f.src,
-                "dst": f.dst,
-                "pg": f.pg,
-                "dport": f.dport,
-                "size_bytes": f.size_bytes,
-                "start_ns": f.start_ns,
+            row = dict(base)
+            row.update({
                 "status": "missing",
                 "fct_ns": None,
                 "finish_ns": None,
@@ -564,6 +780,7 @@ def join_flow_fct_results(fct_records, flows):
                 "fct_start_ns": None,
                 "match_delta_ns": None,
             })
+            rows.append(row)
 
     return rows
 
@@ -579,6 +796,7 @@ def parse_run_log(path: Path):
     userspace_posts = []
     userspace_summaries = []
     gate_mode_events = []
+    mpath_schedules = []
 
     if not path.exists():
         return {
@@ -698,7 +916,32 @@ def parse_run_log(path: Path):
         r"\[RDMA GATE MODE\]\s+mode=(\d+)\s+layer=([A-Za-z0-9_\-]+)"
     )
 
+    re_mpath_schedule = re.compile(
+        r"\[MPATH SCHEDULE\].*?"
+        r"srcToken=([^\s]+).*?"
+        r"dstToken=([^\s]+).*?"
+        r"selectedSrc=([^\s]+).*?"
+        r"selectedDst=([^\s]+).*?"
+        r"srcCarrier=(\d+).*?"
+        r"dstCarrier=(\d+).*?"
+        r"routeCost=(\d+)"
+    )
+
     for line in path.read_text(errors="ignore").splitlines():
+
+        m = re_mpath_schedule.search(line)
+        if m:
+            mpath_schedules.append({
+                "srcToken": m.group(1),
+                "dstToken": m.group(2),
+                "selectedSrc": m.group(3),
+                "selectedDst": m.group(4),
+                "srcCarrier": int(m.group(5)),
+                "dstCarrier": int(m.group(6)),
+                "routeCost": int(m.group(7)),
+            })
+            continue
+
         m = re_ocs_stats.search(line)
         if m:
             stats.append({
@@ -874,7 +1117,94 @@ def parse_run_log(path: Path):
         "userspacePostTotalEvents": sum(x.get("postCount", 0) for x in userspace_summaries) if userspace_summaries else len(userspace_posts),
         "userspacePostSampleCount": len(userspace_posts),
         "gateModeEvents": gate_mode_events,
+        "mpathSchedules": mpath_schedules,
     }
+
+
+
+def carrier_endpoint_label(topology, node_id):
+    ep = (topology.get("carrierToEndpoint") or {}).get(str(node_id))
+    if ep:
+        return ep.get("token") or str(node_id)
+    return str(node_id)
+
+
+def carrier_endpoint_detail(topology, node_id):
+    ep = (topology.get("carrierToEndpoint") or {}).get(str(node_id))
+    if ep:
+        token = ep.get("token") or str(node_id)
+        return f"{token} (carrier {node_id})"
+    return str(node_id)
+
+
+def annotate_log_with_endpoint_labels(log, topology):
+    """Add dashboard-facing endpoint labels to carrier-level control logs.
+
+    Simulator control logs intentionally use concrete carrier RNIC node ids. For
+    multiplane dashboard presentation, convert those ids back to endpoint tokens
+    such as 6-0-0 / 6-0-1 while preserving numeric carrier ids for debugging.
+    """
+    if not log:
+        return log
+
+    def label(node_id):
+        return carrier_endpoint_label(topology, node_id)
+
+    def detail(node_id):
+        return carrier_endpoint_detail(topology, node_id)
+
+    for table in log.get("injectionTables", []) or []:
+        rnic = table.get("rnic")
+        table["rnicLabel"] = label(rnic) if rnic is not None else None
+        table["rnicDetail"] = detail(rnic) if rnic is not None else None
+
+        for win in table.get("windows", []) or []:
+            dsts = win.get("dstRnics", []) or []
+            win["dstLabels"] = [label(x) for x in dsts]
+            win["dstDetails"] = [detail(x) for x in dsts]
+
+    for ev in log.get("userspacePosts", []) or []:
+        src = ev.get("src")
+        dst = ev.get("dst")
+        ev["srcLabel"] = label(src) if src is not None else None
+        ev["dstLabel"] = label(dst) if dst is not None else None
+        ev["srcDetail"] = detail(src) if src is not None else None
+        ev["dstDetail"] = detail(dst) if dst is not None else None
+
+    for row in log.get("userspacePostByFlow", []) or []:
+        src = row.get("src")
+        dst = row.get("dst")
+        row["srcLabel"] = label(src) if src is not None else None
+        row["dstLabel"] = label(dst) if dst is not None else None
+        row["srcDetail"] = detail(src) if src is not None else None
+        row["dstDetail"] = detail(dst) if dst is not None else None
+
+    for row in log.get("rnicRetx", []) or []:
+        rnic = row.get("rnic")
+        src = row.get("src")
+        dst = row.get("dst")
+        row["rnicLabel"] = label(rnic) if rnic is not None else None
+        row["srcLabel"] = label(src) if src is not None else None
+        row["dstLabel"] = label(dst) if dst is not None else None
+
+    for row in log.get("rnicRetxByRnic", []) or []:
+        rnic = row.get("rnic")
+        row["rnicLabel"] = label(rnic) if rnic is not None else None
+        row["rnicDetail"] = detail(rnic) if rnic is not None else None
+
+    for ev in log.get("flowBytes", []) or []:
+        if "src" in ev:
+            ev["srcLabel"] = label(ev.get("src"))
+        if "dst" in ev:
+            ev["dstLabel"] = label(ev.get("dst"))
+
+    for sched in log.get("mpathSchedules", []) or []:
+        src = sched.get("srcCarrier")
+        dst = sched.get("dstCarrier")
+        sched["srcCarrierLabel"] = label(src) if src is not None else None
+        sched["dstCarrierLabel"] = label(dst) if dst is not None else None
+
+    return log
 
 def aggregate_rnic_retx(rnic_retx):
     agg = {}
@@ -1057,9 +1387,9 @@ def build_throughput_from_flow_bytes(flow_bytes, flows, flow_results, bucket_ns)
             if key not in meta:
                 meta[key] = {
                     "flowId": fid,
-                    "label": f"flow{fid}" if f is None else f"{f.src}→{f.dst}",
-                    "src": f.src if f else None,
-                    "dst": f.dst if f else None,
+                    "label": f"flow{fid}" if f is None else f"{flow_display_src(f)}→{flow_display_dst(f)}",
+                    "src": flow_match_src(f) if f else None,
+                    "dst": flow_match_dst(f) if f else None,
                     "sport": None,
                     "dport": f.dport if f else None,
                     "pg": f.pg if f else None,
@@ -1071,9 +1401,26 @@ def build_throughput_from_flow_bytes(flow_bytes, flows, flow_results, bucket_ns)
         else:
             key = ("tuple", _flow_tuple_key(ev["src"], ev["dst"], ev["sport"], ev["dport"], ev["pg"]))
             if key not in meta:
+                matched_flow = None
+                for r in flow_results or []:
+                    if r.get("src") != ev["src"]:
+                        continue
+                    if r.get("dst") != ev["dst"]:
+                        continue
+                    if r.get("dport") != ev["dport"]:
+                        continue
+                    if r.get("pg") != ev["pg"]:
+                        continue
+                    matched_flow = r
+                    break
+
+                label = f"{ev['src']}→{ev['dst']}"
+                if matched_flow:
+                    label = f"{matched_flow.get('display_src') or ev['src']}→{matched_flow.get('display_dst') or ev['dst']}"
+
                 meta[key] = {
                     "flowId": None,
-                    "label": f"{ev['src']}→{ev['dst']}",
+                    "label": label,
                     "src": ev["src"],
                     "dst": ev["dst"],
                     "sport": ev["sport"],
@@ -1204,8 +1551,8 @@ def find_file(exp_dir: Path, names):
 
 
 def build_experiment(exp_dir: Path, bucket_ns: int):
-    topology_path = find_file(exp_dir, ["01-ocs_test_topology.txt", "02-topology.txt", "topology.txt"])
-    schedule_path = find_file(exp_dir, ["05-ocs_test_schedule.txt", "05-ocs_schedule.txt", "schedule.txt"])
+    topology_path = find_file(exp_dir, ["01-ocs_test_topology.txt", "01-multiplane_topology.txt", "02-topology.txt", "topology.txt"])
+    schedule_path = find_file(exp_dir, ["05-ocs_test_schedule.txt", "05-ocs_test_schedule_1.txt", "05-ocs_schedule.txt", "schedule.txt"])
     map_path = find_file(exp_dir, ["04-ocs_map.txt", "ocs_map.txt", "map.txt"])
     flow_path = find_file(exp_dir, ["03-flow.txt", "flow.txt"])
     config_path = find_file(exp_dir, ["config_ocs.txt", "config.txt"])
@@ -1215,10 +1562,12 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
     topology = parse_topology(topology_path)
     config = parse_config(config_path)
     flows = parse_flows(flow_path)
+    log = parse_run_log(run_log_path)
+    annotate_log_with_endpoint_labels(log, topology)
+    attach_mpath_schedules_to_flows(flows, log.get("mpathSchedules", []))
     all_fct = parse_fct(fct_path)
     flow_results = join_flow_fct_results(all_fct, flows)
     fct = [r for r in flow_results if r.get("status") == "completed"]
-    log = parse_run_log(run_log_path)
     throughput = build_throughput_from_flow_bytes(log.get("flowBytes", []), flows, flow_results, bucket_ns)
     
     schedule = parse_schedule(schedule_path)
@@ -1239,6 +1588,7 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
     created = datetime.fromtimestamp(exp_dir.stat().st_mtime).isoformat(timespec="seconds")
 
     rnic_count = len(topology.get("rnics", []))
+    logical_host_count = len(topology.get("logicalNodes", [])) or rnic_count
 
     rnic_retx_by_rnic = log.get("rnicRetxByRnic", [])
 
@@ -1253,7 +1603,8 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
         observed_gate_mode = log["gateModeEvents"][-1]
 
     summary = {
-        "nodeCount": rnic_count,
+        "nodeCount": logical_host_count,
+        "carrierRnicCount": rnic_count,
         "totalNodeCount": topology.get("totalNodes", 0),
         "ocsCount": topology.get("ocsCount", 0),
         "epsCount": topology.get("switchCount", 0),

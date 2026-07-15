@@ -5,6 +5,7 @@ const COLORS = [
 
 let allExperiments = [];
 let selectedExperiment = null;
+let hiddenThroughputSeries = new Set();
 
 function fmtNs(ns) {
   if (ns === null || ns === undefined || Number.isNaN(ns)) return '-';
@@ -86,7 +87,13 @@ function renderExperimentList() {
 }
 
 function selectExperiment(id) {
-  selectedExperiment = allExperiments.find(e => e.id === id) || allExperiments[0] || null;
+  const nextExperiment = allExperiments.find(e => e.id === id) || allExperiments[0] || null;
+
+  if (!selectedExperiment || !nextExperiment || selectedExperiment.id !== nextExperiment.id) {
+    hiddenThroughputSeries.clear();
+  }
+
+  selectedExperiment = nextExperiment;
   renderExperimentList();
   renderExperiment();
 }
@@ -128,7 +135,7 @@ function renderBadges(exp) {
   const s = exp.summary || {};
 
   document.getElementById('summaryBadges').innerHTML = `
-    <span class="badge">RDMA-NIC (RNIC): ${s.nodeCount ?? 0}</span>
+    <span class="badge">Node: ${s.nodeCount ?? 0}</span>
     <span class="badge">OCS: ${s.ocsCount ?? 0}</span>
     <span class="badge">EPS: ${s.epsCount ?? 0}</span>
     <span class="badge">Flow: ${s.flowCount ?? 0}</span>
@@ -244,7 +251,197 @@ function buildHierarchy(topology) {
   };
 }
 
+
+function hasLogicalEndpointView(topology) {
+  return (topology.logicalNodes || []).some(n => (n.endpoints || []).length > 0);
+}
+
+function typeOrderForFabric(t) {
+  if (t === 'ocs') return 0;
+  if (t === 'eps') return 1;
+  return 2;
+}
+
+function layoutLogicalEndpointTopology(topology) {
+  const nodes = topology.nodes || [];
+  const links = topology.links || [];
+  const logicalNodes = (topology.logicalNodes || [])
+    .slice()
+    .sort((a, b) => Number(a.logicalId) - Number(b.logicalId));
+
+  const nodeById = new Map(nodes.map(n => [n.id, n]));
+  const pos = new Map();
+  const typeOf = id => nodeById.get(id)?.type || 'rnic';
+
+  const ocsNodes = nodes.filter(n => n.type === 'ocs').slice().sort((a, b) => a.id - b.id);
+  const epsNodes = nodes.filter(n => n.type === 'eps').slice().sort((a, b) => a.id - b.id);
+  const ocsSet = new Set(ocsNodes.map(n => n.id));
+  const ocsOcsLinks = links.filter(l => typeOf(l.src) === 'ocs' && typeOf(l.dst) === 'ocs');
+  const ocsAdj = new Map();
+
+  ocsNodes.forEach(n => ocsAdj.set(n.id, []));
+  ocsOcsLinks.forEach(l => {
+    ocsAdj.get(l.src)?.push(l.dst);
+    ocsAdj.get(l.dst)?.push(l.src);
+  });
+  ocsAdj.forEach(list => list.sort((a, b) => a - b));
+
+  function nonOcsDegree(id) {
+    return links.filter(l => {
+      if (l.src === id) return !ocsSet.has(l.dst);
+      if (l.dst === id) return !ocsSet.has(l.src);
+      return false;
+    }).length;
+  }
+
+  const logicalBoxW = Math.max(140, Math.min(220, 92 + Math.max(0, ...logicalNodes.map(n => (n.endpoints || []).length)) * 46));
+  const logicalGap = 72;
+  const leftPad = 56;
+  const canvasWidth = Math.max(
+    560,
+    leftPad * 2 + logicalNodes.length * logicalBoxW + Math.max(0, logicalNodes.length - 1) * logicalGap,
+    leftPad * 2 + Math.max(1, ocsNodes.length) * 120
+  );
+
+  let maxOcsLevel = 0;
+
+  if (ocsNodes.length) {
+    let roots = ocsNodes
+      .filter(o => nonOcsDegree(o.id) === 0 && (ocsAdj.get(o.id) || []).length > 0)
+      .map(o => o.id)
+      .sort((a, b) => a - b);
+
+    if (!roots.length) {
+      const best = ocsNodes
+        .slice()
+        .sort((a, b) => ((ocsAdj.get(b.id) || []).length - (ocsAdj.get(a.id) || []).length) || a.id - b.id)[0];
+      roots = best ? [best.id] : [];
+    }
+
+    const level = new Map();
+    const queue = [];
+
+    roots.forEach(r => {
+      level.set(r, 0);
+      queue.push(r);
+    });
+
+    while (queue.length) {
+      const u = queue.shift();
+      (ocsAdj.get(u) || []).forEach(v => {
+        if (!level.has(v)) {
+          level.set(v, level.get(u) + 1);
+          queue.push(v);
+        }
+      });
+    }
+
+    ocsNodes.forEach(o => {
+      if (!level.has(o.id)) {
+        level.set(o.id, 0);
+      }
+    });
+
+    maxOcsLevel = Math.max(0, ...Array.from(level.values()));
+
+    const byLevel = new Map();
+    ocsNodes.forEach(o => {
+      const lv = level.get(o.id) || 0;
+      if (!byLevel.has(lv)) byLevel.set(lv, []);
+      byLevel.get(lv).push(o.id);
+    });
+
+    byLevel.forEach((ids, lv) => {
+      ids.sort((a, b) => a - b);
+      const gap = Math.min(170, Math.max(110, canvasWidth / Math.max(2, ids.length + 1)));
+      const start = canvasWidth / 2 - ((ids.length - 1) * gap) / 2;
+
+      ids.forEach((id, idx) => {
+        pos.set(id, {
+          x: start + idx * gap,
+          y: 48 + lv * 86,
+          type: 'ocs'
+        });
+      });
+    });
+  }
+
+  if (epsNodes.length) {
+    const y = 58 + (maxOcsLevel + 1) * 86;
+    const gap = Math.min(160, Math.max(110, canvasWidth / Math.max(2, epsNodes.length + 1)));
+    const start = canvasWidth / 2 - ((epsNodes.length - 1) * gap) / 2;
+
+    epsNodes.forEach((e, idx) => {
+      pos.set(e.id, {
+        x: start + idx * gap,
+        y,
+        type: 'eps'
+      });
+    });
+  }
+
+  const logicalY = 58 + (maxOcsLevel + 1) * 86 + (epsNodes.length ? 86 : 74);
+  const totalLogicalWidth = logicalNodes.length * logicalBoxW + Math.max(0, logicalNodes.length - 1) * logicalGap;
+  let cursor = canvasWidth / 2 - totalLogicalWidth / 2;
+  const logicalBoxes = [];
+
+  logicalNodes.forEach(ln => {
+    const endpoints = (ln.endpoints || []).slice().sort((a, b) => {
+      return Number(a.rnicGroupId) - Number(b.rnicGroupId) ||
+        Number(a.planeId) - Number(b.planeId) ||
+        Number(a.carrierNodeId) - Number(b.carrierNodeId);
+    });
+
+    const x = cursor + logicalBoxW / 2;
+    const box = {
+      logicalId: ln.logicalId,
+      label: ln.label || `Node ${ln.logicalId}`,
+      x,
+      y: logicalY,
+      width: logicalBoxW,
+      height: 76,
+      endpoints
+    };
+
+    const epGap = endpoints.length > 1 ? Math.min(54, (logicalBoxW - 44) / (endpoints.length - 1)) : 0;
+    const epStart = x - ((endpoints.length - 1) * epGap) / 2;
+
+    endpoints.forEach((ep, idx) => {
+      const ex = epStart + idx * epGap;
+      const ey = logicalY - 20;
+      ep._x = ex;
+      ep._y = ey;
+      pos.set(Number(ep.carrierNodeId), {
+        x: ex,
+        y: ey,
+        type: 'rnic',
+        endpointToken: ep.token,
+        logicalId: ep.logicalId,
+        planeId: ep.planeId,
+        rnicGroupId: ep.rnicGroupId,
+      });
+    });
+
+    logicalBoxes.push(box);
+    cursor += logicalBoxW + logicalGap;
+  });
+
+  const height = logicalY + 58;
+
+  return {
+    pos,
+    width: canvasWidth,
+    height,
+    logicalBoxes,
+    logicalEndpointView: true,
+  };
+}
+
 function layoutHierarchy(topology) {
+  if (hasLogicalEndpointView(topology)) {
+    return layoutLogicalEndpointTopology(topology);
+  }
+
   const nodes = topology.nodes || [];
   const links = topology.links || [];
   const nodeById = new Map(nodes.map(n => [n.id, n]));
@@ -1122,6 +1319,59 @@ function colorForMapping(conn, idx) {
   return palette[h % palette.length] || palette[idx % palette.length];
 }
 
+
+function fallbackPortAngle(port) {
+  const p = Number(port) || 0;
+  const angles = [-Math.PI / 2, Math.PI / 2, 0, Math.PI, -Math.PI / 4, Math.PI / 4, -3 * Math.PI / 4, 3 * Math.PI / 4];
+  return angles[p % angles.length];
+}
+
+function ocsPortAnchor(pos, portMap, ocsId, port, radius) {
+  const center = pos.get(ocsId);
+  if (!center) return null;
+
+  const peer = portMap[`${ocsId}:${port}`];
+  const peerPos = peer ? pos.get(peer.node) : null;
+  let dx = 0;
+  let dy = 0;
+
+  if (peerPos) {
+    dx = peerPos.x - center.x;
+    dy = peerPos.y - center.y;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    dx /= len;
+    dy /= len;
+  } else {
+    const a = fallbackPortAngle(port);
+    dx = Math.cos(a);
+    dy = Math.sin(a);
+  }
+
+  return {
+    x: center.x + dx * radius,
+    y: center.y + dy * radius
+  };
+}
+
+function renderActiveExternalSegments(pos, portMap, conn, color) {
+  const center = pos.get(conn.ocs);
+  if (!center) return '';
+
+  return [conn.a, conn.b].map(port => {
+    const peer = portMap[`${conn.ocs}:${port}`];
+    if (!peer) return '';
+
+    const peerPos = pos.get(peer.node);
+    if (!peerPos) return '';
+
+    // Keep the historical topology rendering behavior: active circuits are
+    // highlighted by coloring the existing physical edge segments up to the
+    // OCS node, while the actual OCS port-pair is shown as a text annotation
+    // above the OCS. Do not draw an internal line inside the device icon.
+    return `<line class="link-active-colored" style="stroke:${color}" x1="${peerPos.x}" y1="${peerPos.y}" x2="${center.x}" y2="${center.y}" />`;
+  }).join('');
+}
+
 function renderSliceTopology(exp) {
   const topology = exp.topology || {};
   const schedule = exp.schedule || {};
@@ -1137,7 +1387,10 @@ function renderSliceTopology(exp) {
 }
 
 function renderOneInterval(topology, interval) {
-  const {pos, width, height} = layoutHierarchy(topology);
+  const layout = layoutHierarchy(topology);
+  const {pos, width, height} = layout;
+  const logicalBoxes = layout.logicalBoxes || [];
+  const logicalEndpointView = !!layout.logicalEndpointView;
   const links = topology.links || [];
   const portMap = topology.ocsPortToNeighbor || {};
   const activeByOcs = buildActiveOcsMap(interval.connections || []);
@@ -1152,62 +1405,74 @@ function renderOneInterval(topology, interval) {
     return `<line class="link-physical" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" />`;
   }).join('');
 
-  const activeLines = (interval.connections || []).map(c => {
-    const left = portMap[`${c.ocs}:${c.a}`];
-    const right = portMap[`${c.ocs}:${c.b}`];
+  const activeExternalLines = (interval.connections || []).map(c => {
     const color = colorForConnectionComponent(componentOf, c);
-    const segments = [];
-    const ocs = pos.get(c.ocs);
-
-    if (!ocs) return '';
-
-    if (left) {
-      const pn = pos.get(left.node);
-      if (pn) {
-        segments.push(`<line class="link-active-colored" style="stroke:${color}" x1="${pn.x}" y1="${pn.y}" x2="${ocs.x}" y2="${ocs.y}" />`);
-      }
-    }
-
-    if (right) {
-      const pn = pos.get(right.node);
-      if (pn) {
-        segments.push(`<line class="link-active-colored" style="stroke:${color}" x1="${pn.x}" y1="${pn.y}" x2="${ocs.x}" y2="${ocs.y}" />`);
-      }
-    }
-
-    return segments.join('');
+    return renderActiveExternalSegments(pos, portMap, c, color);
   }).join('');
 
-  const nodeEls = (topology.nodes || []).map(n => {
-    const p = pos.get(n.id);
 
-    if (!p) return '';
+  const fabricNodeEls = (topology.nodes || [])
+    .filter(n => !(logicalEndpointView && n.type === 'rnic'))
+    .map(n => {
+      const p = pos.get(n.id);
 
-    if (n.type === 'ocs') {
+      if (!p) return '';
+
+      if (n.type === 'ocs') {
+        return `
+          <g class="node-group node-group-ocs">
+            <title>OCS ${n.id}</title>
+            <rect class="node-ocs" x="${p.x - 20}" y="${p.y - 20}" width="40" height="40" rx="7" transform="rotate(45 ${p.x} ${p.y})"/>
+            <text class="node-label node-label-ocs" x="${p.x}" y="${p.y}">O${n.id}</text>
+          </g>
+        `;
+      }
+
+      if (n.type === 'eps') {
+        return `
+          <g class="node-group node-group-eps">
+            <title>EPS ${n.id}</title>
+            <rect class="node-eps" x="${p.x - 28}" y="${p.y - 16}" width="56" height="32" rx="9"/>
+            <text class="node-label node-label-eps" x="${p.x}" y="${p.y}">E${n.id}</text>
+          </g>
+        `;
+      }
+
       return `
-        <g class="node-group node-group-ocs">
-          <rect class="node-ocs" x="${p.x - 20}" y="${p.y - 20}" width="40" height="40" rx="7" transform="rotate(45 ${p.x} ${p.y})"/>
-          <text class="node-label node-label-ocs" x="${p.x}" y="${p.y}">O${n.id}</text>
+        <g class="node-group node-group-host">
+          <circle class="node-rnic" cx="${p.x}" cy="${p.y}" r="18"/>
+          <text class="node-label node-label-host" x="${p.x}" y="${p.y}">H${n.id}</text>
         </g>
       `;
-    }
+    }).join('');
 
-    if (n.type === 'eps') {
+  const logicalNodeEls = logicalBoxes.map(box => {
+    const endpointEls = (box.endpoints || []).map(ep => {
+      const p = pos.get(Number(ep.carrierNodeId));
+      if (!p) return '';
+      const label = ep.label || `P${ep.planeId}`;
+      const title = `Endpoint ${ep.token}\nLogical node: ${ep.logicalId}\nRNIC group: ${ep.rnicGroupId}\nPlane: ${ep.planeId}\nCarrier RNIC: ${ep.carrierNodeId}`;
       return `
-        <g class="node-group node-group-eps">
-          <rect class="node-eps" x="${p.x - 28}" y="${p.y - 16}" width="56" height="32" rx="9"/>
-          <text class="node-label node-label-eps" x="${p.x}" y="${p.y}">E${n.id}</text>
+        <g class="logical-endpoint-port">
+          <title>${escapeHtml(title)}</title>
+          <circle class="endpoint-port-dot" cx="${p.x}" cy="${p.y}" r="7"/>
+          <text class="endpoint-port-label" x="${p.x}" y="${p.y + 20}">${escapeHtml(label)}</text>
+          <text class="endpoint-token-label" x="${p.x}" y="${p.y + 34}">${escapeHtml(ep.token)}</text>
         </g>
       `;
-    }
+    }).join('');
 
     return `
-      <g class="node-group node-group-host">
-        <circle class="node-rnic" cx="${p.x}" cy="${p.y}" r="18"/>
-        <text class="node-label node-label-host" x="${p.x}" y="${p.y}">H${n.id}</text>
+      <g class="logical-node-group">
+        <title>${escapeHtml(box.label)}</title>
+        <rect class="logical-node-card" x="${box.x - box.width / 2}" y="${box.y - box.height / 2}" width="${box.width}" height="${box.height}" rx="12"/>
+        <text class="logical-node-title" x="${box.x}" y="${box.y + 22}">${escapeHtml(box.label)}</text>
+        ${endpointEls}
       </g>
     `;
   }).join('');
+
+  const nodeEls = fabricNodeEls + logicalNodeEls;
 
   const portAnnotations = (topology.nodes || [])
     .filter(n => n.type === 'ocs')
@@ -1243,12 +1508,12 @@ function renderOneInterval(topology, interval) {
       <div class="mapping-legend">${mappingLegend}</div>
       <svg class="topology-svg" viewBox="0 0 ${width} ${height}" role="img">
         ${physical}
-        ${activeLines}
+        ${activeExternalLines}
         ${nodeEls}
         ${portAnnotations}
       </svg>
       <div class="topology-node-legend">
-        <span><span class="legend-shape legend-host"></span>RNIC</span>
+        <span><span class="legend-shape legend-host"></span>${logicalEndpointView ? 'Logical node / endpoint' : 'RNIC'}</span>
         <span><span class="legend-shape legend-eps"></span>EPS</span>
         <span><span class="legend-shape legend-ocs"></span>OCS</span>
       </div>
@@ -1380,6 +1645,8 @@ function renderThroughput(exp) {
   }
 
   const lines = series.map((s, idx) => {
+    if (hiddenThroughputSeries.has(idx)) return '';
+
     const color = COLORS[idx % COLORS.length];
     const d = buildStepPath(s.points || [], s.bucketNs);
 
@@ -1411,16 +1678,47 @@ function renderThroughput(exp) {
     if (fctAvg !== null && fctAvg !== undefined) detailParts.push(`FCT avg ${fmtGbps(fctAvg)}`);
     if (activeAvg !== null && activeAvg !== undefined) detailParts.push(`active avg ${fmtGbps(activeAvg)}`);
 
-    const title = escapeHtml(detailParts.join(' · '));
+    const isVisible = !hiddenThroughputSeries.has(idx);
+    const detail = detailParts.join(' · ');
+    const title = escapeHtml(`${isVisible ? 'Click to hide' : 'Click to show'}${detail ? ` · ${detail}` : ''}`);
     const visibleLabel = visibleParts.join(' ');
 
     return `
-      <div class="legend-item" title="${title}">
+      <div
+        class="legend-item ${isVisible ? '' : 'is-hidden'}"
+        data-series-index="${idx}"
+        role="button"
+        tabindex="0"
+        aria-pressed="${isVisible}"
+        title="${title}"
+      >
         <span class="legend-swatch" style="background:${COLORS[idx % COLORS.length]}"></span>
         ${escapeHtml(visibleLabel)}
       </div>
     `;
   }).join('');
+
+  legend.querySelectorAll('.legend-item').forEach(item => {
+    const toggleSeries = () => {
+      const idx = Number(item.dataset.seriesIndex);
+
+      if (hiddenThroughputSeries.has(idx)) {
+        hiddenThroughputSeries.delete(idx);
+      } else {
+        hiddenThroughputSeries.add(idx);
+      }
+
+      renderThroughput(exp);
+    };
+
+    item.addEventListener('click', toggleSeries);
+    item.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleSeries();
+      }
+    });
+  });
 }
 
 function renderTable(rootId, columns, rows) {
@@ -1460,8 +1758,11 @@ function renderFlowResultTable(exp) {
 
   renderTable('flowResultTable', [
     {key: 'index', label: '#'},
-    {key: 'src', label: 'src'},
-    {key: 'dst', label: 'dst'},
+    {key: 'display_src', label: 'src'},
+    {key: 'display_dst', label: 'dst'},
+    {key: 'src_carrier', label: 'src carrier'},
+    {key: 'dst_carrier', label: 'dst carrier'},
+    {key: 'route_cost', label: 'route cost'},
     {key: 'dport', label: 'dport'},
     {key: 'size_bytes', label: 'size', format: fmtBytes},
     {key: 'start_ns', label: 'start', format: fmtNs},
@@ -1502,19 +1803,23 @@ function renderInjectionTable(exp) {
   }
 
   const rows = tables.flatMap(t => (t.windows || []).map(w => ({
-    rnic: t.rnic,
+    rnicLabel: t.rnicLabel || String(t.rnic),
+    rnicCarrier: t.rnic,
     window: w.window,
     startNs: w.startNs,
     endNs: w.endNs,
-    dsts: (w.dstRnics || []).join(',')
+    dstLabels: (w.dstLabels && w.dstLabels.length ? w.dstLabels : (w.dstRnics || []).map(String)).join(', '),
+    dstCarriers: (w.dstRnics || []).join(', ')
   })));
 
   renderTable('injectionTable', [
-    {key: 'rnic', label: 'RNIC'},
+    {key: 'rnicLabel', label: 'RNIC endpoint'},
+    {key: 'rnicCarrier', label: 'carrier'},
     {key: 'window', label: 'window'},
     {key: 'startNs', label: 'start', format: fmtNs},
     {key: 'endNs', label: 'end', format: fmtNs},
-    {key: 'dsts', label: 'dst RNICs'}
+    {key: 'dstLabels', label: 'dst endpoints'},
+    {key: 'dstCarriers', label: 'dst carriers'}
   ], rows);
 }
 
@@ -1525,8 +1830,8 @@ function renderInjectionControlSummary(exp) {
 
   const rows = [
     {key: 'Mode', value: `${s.injectionMode ?? '-'} · ${s.injectionModeName || '-'}`},
-    {key: 'Layer', value: s.observedInjectionLayer || s.injectionLayer || '-'},
-    {key: 'Completed', value: `${s.fctCount ?? 0} / ${s.flowCount ?? 0}`},
+    // {key: 'Layer', value: s.observedInjectionLayer || s.injectionLayer || '-'},
+    {key: 'Flows Completed', value: `${s.fctCount ?? 0} / ${s.flowCount ?? 0}`},
     {key: 'Switching drops', value: s.totalDropSwitching ?? 0},
     {
       key: 'Retx summary',
@@ -1583,9 +1888,27 @@ function renderUserspacePostTable(exp) {
       : `Showing ${shown.toLocaleString()} post events.`;
   }
 
+  const summaryRows = byFlow.map(r => ({
+    ...r,
+    srcDisplay: r.srcLabel || String(r.src),
+    dstDisplay: r.dstLabel || String(r.dst),
+    srcCarrier: r.src,
+    dstCarrier: r.dst
+  }));
+
+  const eventRows = rows.map(r => ({
+    ...r,
+    srcDisplay: r.srcLabel || String(r.src),
+    dstDisplay: r.dstLabel || String(r.dst),
+    srcCarrier: r.src,
+    dstCarrier: r.dst
+  }));
+
   renderTable('userspacePostSummaryTable', [
-    {key: 'src', label: 'src'},
-    {key: 'dst', label: 'dst'},
+    {key: 'srcDisplay', label: 'src endpoint'},
+    {key: 'dstDisplay', label: 'dst endpoint'},
+    {key: 'srcCarrier', label: 'src carrier'},
+    {key: 'dstCarrier', label: 'dst carrier'},
     {key: 'sport', label: 'sport'},
     {key: 'dport', label: 'dport'},
     {key: 'postCount', label: 'posts'},
@@ -1596,12 +1919,14 @@ function renderUserspacePostTable(exp) {
     {key: 'firstPostTimeNs', label: 'first post', format: fmtNs},
     {key: 'lastPostTimeNs', label: 'last post', format: fmtNs},
     {key: 'safeBudgetLimitedCount', label: 'budget-limited'}
-  ], byFlow);
+  ], summaryRows);
 
   renderTable('userspacePostTable', [
     {key: 'timeNs', label: 'time', format: fmtNs},
-    {key: 'src', label: 'src'},
-    {key: 'dst', label: 'dst'},
+    {key: 'srcDisplay', label: 'src endpoint'},
+    {key: 'dstDisplay', label: 'dst endpoint'},
+    {key: 'srcCarrier', label: 'src carrier'},
+    {key: 'dstCarrier', label: 'dst carrier'},
     {key: 'sport', label: 'sport'},
     {key: 'dport', label: 'dport'},
     {key: 'bytes', label: 'WR bytes', format: fmtBytes},
@@ -1609,19 +1934,26 @@ function renderUserspacePostTable(exp) {
     {key: 'outstanding', label: 'outstanding', format: fmtBytes},
     {key: 'safeBudget', label: 'safe budget', format: fmtBytes},
     {key: 'windowEnd', label: 'window end', format: fmtNs}
-  ], rows);
+  ], eventRows);
 }
 
 function renderRnicRetxTable(exp) {
   const rows = (exp.log && exp.log.rnicRetxByRnic) || [];
 
+  const displayRows = rows.map(r => ({
+    ...r,
+    rnicDisplay: r.rnicLabel || String(r.rnic),
+    rnicCarrier: r.rnic
+  }));
+
   renderTable('rnicRetxTable', [
-    {key: 'rnic', label: 'RNIC'},
+    {key: 'rnicDisplay', label: 'RNIC endpoint'},
+    {key: 'rnicCarrier', label: 'carrier'},
     {key: 'flows', label: 'flows'},
     {key: 'recoverEvents', label: 'recover events'},
     {key: 'retxPackets', label: 'retx packets'},
     {key: 'retxBytes', label: 'retx bytes'}
-  ], rows);
+  ], displayRows);
 }
 
 document.getElementById('experimentSearch').addEventListener('input', renderExperimentList);
