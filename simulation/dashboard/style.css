@@ -554,3 +554,221 @@ th {
 .wide-table {
   max-height: 520px;
 }
+
+
+/* =========================
+   Injection control / control-plane layout
+   ========================= */
+
+#userspacePostSection {
+  display: block;
+}
+
+.badge.warn {
+  background: #fff0c2;
+  color: #7d5a00;
+}
+
+.badge.good {
+  background: #dcefdc;
+  color: #2d6b35;
+}
+
+/*
+ * Control-plane row:
+ *   left  column: OCS Stats + Injection Control Summary
+ *   right column: Injection Window Table
+ *
+ * The right card height is synchronized to the left column by app.js
+ * through syncInjectionWindowHeight(). The table scrolls internally.
+ */
+.control-plane-grid {
+  display: grid;
+  grid-template-columns: minmax(340px, 380px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.control-plane-left {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.control-plane-left .card,
+.control-plane-left .compact-card {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.compact-card {
+  padding: 14px;
+}
+
+.compact-header {
+  margin-bottom: 8px;
+}
+
+.compact-header h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.compact-table {
+  max-height: 190px;
+  overflow: auto;
+}
+
+.compact-card table {
+  table-layout: auto;
+  font-size: 11px;
+}
+
+.compact-card th,
+.compact-card td {
+  padding: 6px 7px;
+  white-space: nowrap;
+}
+
+.compact-card .kv-list {
+  display: grid;
+  gap: 6px;
+}
+
+.compact-card .kv {
+  display: grid;
+  grid-template-columns: 102px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 8px;
+  font-size: 11px;
+}
+
+.compact-card .kv .key {
+  min-width: 0;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.compact-card .kv .value {
+  min-width: 0;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: normal;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Injection Window Table card */
+.injection-window-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.injection-window-card .card-header {
+  flex: 0 0 auto;
+  margin-bottom: 10px;
+}
+
+.injection-window-card .card-header h3 {
+  margin-bottom: 4px;
+}
+
+.injection-window-card .muted {
+  display: block;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.injection-window-card .table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  overflow: auto;
+}
+
+.injection-window-card table {
+  table-layout: fixed;
+}
+
+.injection-window-card th,
+.injection-window-card td {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.injection-window-card th:nth-child(1),
+.injection-window-card td:nth-child(1) {
+  width: 74px;
+}
+
+.injection-window-card th:nth-child(2),
+.injection-window-card td:nth-child(2) {
+  width: 82px;
+}
+
+.injection-window-card th:nth-child(3),
+.injection-window-card td:nth-child(3),
+.injection-window-card th:nth-child(4),
+.injection-window-card td:nth-child(4) {
+  width: 125px;
+}
+
+.injection-window-card th:nth-child(5),
+.injection-window-card td:nth-child(5) {
+  width: auto;
+}
+
+/* Userspace WR post section */
+.userspace-post-card .card-header {
+  margin-bottom: 10px;
+}
+
+.compact-userspace-summary {
+  max-height: 220px;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: auto;
+}
+
+#userspacePostTable {
+  max-height: 480px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: auto;
+}
+
+/* Responsive fallbacks */
+@media (max-width: 1280px) {
+  .control-plane-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .control-plane-left {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .injection-window-card {
+    height: auto !important;
+  }
+
+  .injection-window-card .table-wrap {
+    max-height: 520px;
+  }
+}
+
+@media (max-width: 780px) {
+  .control-plane-left {
+    grid-template-columns: 1fr;
+  }
+}
+

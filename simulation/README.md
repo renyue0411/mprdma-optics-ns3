@@ -377,7 +377,7 @@ Additional files added/edited for OCS/RDMA support:
 - `point-to-point/model/rdma-ocs-controller.cc/h`: controller for deriving RNIC-side injection windows from OCS schedules and EPS/OCS topology.
 - `point-to-point/model/rdma-hw.cc/h`: extended RDMA hardware logic with RNIC-side injection gating and OCS-aware transmission control.
 - `point-to-point/model/rdma-queue-pair.cc/h`: queue pair logic extended for OCS/RNIC gating interaction.
-- `point-to-point/model/rdma-transport-control.cc/h`: transport control logic used by RDMA/OCS experiments.
+- `point-to-point/model/rdma-userspace-transport.cc/h`: transport control logic in userspace used by RDMA/OCS experiments.
 - `point-to-point/model/rdma-driver.cc/h`: RDMA driver logic used for QP creation and experiment flow setup.
 - `point-to-point/model/qbb-net-device.cc/h`: QBB net device logic extended for OCS/EPS hybrid forwarding behavior.
 

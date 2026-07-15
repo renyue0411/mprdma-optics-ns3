@@ -32,7 +32,7 @@ def build(bld):
         'helper/mp-qbb-helper.cc',
         'model/mp-switch-node.cc',
         'model/ocs-node.cc',
-        'model/rdma-transport-control.cc',
+        'model/rdma-userspace-transport.cc',
         'model/rdma-ocs-controller.cc',
         ]
 
@@ -74,7 +74,7 @@ def build(bld):
         'helper/mp-qbb-helper.h',
         'model/mp-switch-node.h',
         'model/ocs-node.h',
-        'model/rdma-transport-control.h',
+        'model/rdma-userspace-transport.h',
         'model/rdma-ocs-controller.h',
         ]
 

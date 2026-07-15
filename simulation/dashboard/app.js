@@ -104,7 +104,24 @@ function renderExperiment() {
   renderFlowResultTable(exp);
   renderOcsStats(exp);
   renderInjectionTable(exp);
+  renderInjectionControlSummary(exp);
+  renderUserspacePostTable(exp);
   renderRnicRetxTable(exp);
+
+  requestAnimationFrame(syncInjectionWindowHeight);
+}
+
+function syncInjectionWindowHeight() {
+  const left = document.querySelector('.control-plane-left');
+  const right = document.querySelector('.injection-window-card');
+
+  if (!left || !right) return;
+
+  const leftHeight = left.offsetHeight;
+
+  if (leftHeight > 0) {
+    right.style.height = `${leftHeight}px`;
+  }
 }
 
 function renderBadges(exp) {
@@ -117,9 +134,10 @@ function renderBadges(exp) {
     <span class="badge">Flow: ${s.flowCount ?? 0}</span>
     <span class="badge">OCS Mode: ${escapeHtml(s.ocsMode || '-')}</span>
     <span class="badge">CC Method: ${escapeHtml(s.ccName || '-')}</span>
-    <span class="badge">RNIC Control: ${escapeHtml(s.rnicGateMode || '-')}</span>
+    <span class="badge">Injection Control: ${escapeHtml(s.injectionModeName || s.rnicGateMode || '-')}</span>
   `;
 }
+
 function buildAdjacency(topology) {
   const adj = new Map();
 
@@ -1408,6 +1426,11 @@ function renderThroughput(exp) {
 function renderTable(rootId, columns, rows) {
   const root = document.getElementById(rootId);
 
+  if (!root) {
+    console.warn(`Missing table root: ${rootId}`);
+    return;
+  }
+
   if (!rows || !rows.length) {
     root.innerHTML = '<p class="muted">No data.</p>';
     return;
@@ -1457,21 +1480,26 @@ function renderOcsStats(exp) {
     {key: 'node', label: 'OCS'},
     {key: 'forwardedPackets', label: 'fwd pkts'},
     {key: 'forwardedBytes', label: 'fwd bytes'},
-    {key: 'dropSwitching', label: 'switching drops'},
-    {key: 'dropNoCircuit', label: 'no circuit drops'}
+    {key: 'dropSwitching', label: 'sw drops'},
+    {key: 'dropNoCircuit', label: 'no-circ drops'}
   ], rows);
 }
 
 function renderInjectionTable(exp) {
   const s = exp.summary || {};
+  const tables = (exp.log && exp.log.injectionTables) || [];
 
-  if (s.rnicGateMode === 'disabled') {
+  const mode = Number(
+    s.injectionMode !== undefined && s.injectionMode !== null
+      ? s.injectionMode
+      : s.observedInjectionMode
+  );
+
+  if (mode === 0) {
     document.getElementById('injectionTable').innerHTML =
-      '<p class="muted">Default RDMA mode: RNIC injection gate is disabled.</p>';
+      '<p class="muted">Default RDMA mode: injection control is disabled.</p>';
     return;
   }
-
-  const tables = (exp.log && exp.log.injectionTables) || [];
 
   const rows = tables.flatMap(t => (t.windows || []).map(w => ({
     rnic: t.rnic,
@@ -1487,6 +1515,100 @@ function renderInjectionTable(exp) {
     {key: 'startNs', label: 'start', format: fmtNs},
     {key: 'endNs', label: 'end', format: fmtNs},
     {key: 'dsts', label: 'dst RNICs'}
+  ], rows);
+}
+
+function renderInjectionControlSummary(exp) {
+  const s = exp.summary || {};
+  const log = exp.log || {};
+  const postSummary = log.userspacePostSummary || {};
+
+  const rows = [
+    {key: 'Mode', value: `${s.injectionMode ?? '-'} · ${s.injectionModeName || '-'}`},
+    {key: 'Layer', value: s.observedInjectionLayer || s.injectionLayer || '-'},
+    {key: 'Completed', value: `${s.fctCount ?? 0} / ${s.flowCount ?? 0}`},
+    {key: 'Switching drops', value: s.totalDropSwitching ?? 0},
+    {
+      key: 'Retx summary',
+      value: `${s.totalRecoverEvents ?? 0} events / ${s.totalRetxPackets ?? 0} packets / ${fmtBytes(s.totalRetxBytes ?? 0)}`
+    }
+  ];
+
+  if (Number(s.injectionMode) === 2 || (postSummary.count || 0) > 0) {
+    rows.push(
+      {key: 'Userspace posts', value: postSummary.count ?? 0},
+      {key: 'Posted bytes', value: fmtBytes(postSummary.totalBytes ?? 0)},
+      {
+        key: 'Avg post size',
+        value: postSummary.avgBytes === null || postSummary.avgBytes === undefined
+          ? '-'
+          : fmtBytes(postSummary.avgBytes)
+      },
+      {key: 'First post', value: fmtOptionalNs(postSummary.firstPostTimeNs)},
+      {key: 'Last post', value: fmtOptionalNs(postSummary.lastPostTimeNs)},
+      {key: 'Safe-budget limited', value: postSummary.safeBudgetLimitedCount ?? 0}
+    );
+  }
+
+  document.getElementById('injectionSummary').innerHTML = `
+    <div class="kv-list">
+      ${rows.map(r => `
+        <div class="kv">
+          <div class="key">${escapeHtml(r.key)}</div>
+          <div class="value">${escapeHtml(r.value)}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderUserspacePostTable(exp) {
+  const log = exp.log || {};
+  const rows = log.userspacePosts || [];
+  const byFlow = log.userspacePostByFlow || [];
+
+  const card = document.getElementById('userspacePostSection');
+
+  if (card) {
+    card.style.display = rows.length || byFlow.length ? '' : 'none';
+  }
+
+  const total = log.userspacePostTotalEvents ?? rows.length;
+  const shown = rows.length;
+
+  const meta = document.getElementById('userspacePostMeta');
+  if (meta) {
+    meta.textContent = total > shown
+      ? `Showing ${shown.toLocaleString()} of ${total.toLocaleString()} post events. Summary is computed over all events.`
+      : `Showing ${shown.toLocaleString()} post events.`;
+  }
+
+  renderTable('userspacePostSummaryTable', [
+    {key: 'src', label: 'src'},
+    {key: 'dst', label: 'dst'},
+    {key: 'sport', label: 'sport'},
+    {key: 'dport', label: 'dport'},
+    {key: 'postCount', label: 'posts'},
+    {key: 'totalBytes', label: 'total posted', format: fmtBytes},
+    {key: 'avgBytes', label: 'avg WR', format: fmtBytes},
+    {key: 'minBytes', label: 'min WR', format: fmtBytes},
+    {key: 'maxBytes', label: 'max WR', format: fmtBytes},
+    {key: 'firstPostTimeNs', label: 'first post', format: fmtNs},
+    {key: 'lastPostTimeNs', label: 'last post', format: fmtNs},
+    {key: 'safeBudgetLimitedCount', label: 'budget-limited'}
+  ], byFlow);
+
+  renderTable('userspacePostTable', [
+    {key: 'timeNs', label: 'time', format: fmtNs},
+    {key: 'src', label: 'src'},
+    {key: 'dst', label: 'dst'},
+    {key: 'sport', label: 'sport'},
+    {key: 'dport', label: 'dport'},
+    {key: 'bytes', label: 'WR bytes', format: fmtBytes},
+    {key: 'postedLimit', label: 'posted limit', format: fmtBytes},
+    {key: 'outstanding', label: 'outstanding', format: fmtBytes},
+    {key: 'safeBudget', label: 'safe budget', format: fmtBytes},
+    {key: 'windowEnd', label: 'window end', format: fmtNs}
   ], rows);
 }
 
@@ -1506,3 +1628,21 @@ document.getElementById('experimentSearch').addEventListener('input', renderExpe
 document.getElementById('normalizeTime').addEventListener('change', () => renderThroughput(selectedExperiment));
 
 loadData();
+
+window.addEventListener('resize', () => {
+  requestAnimationFrame(syncInjectionWindowHeight);
+});
+
+const controlPlaneObserver = new ResizeObserver(() => {
+  requestAnimationFrame(syncInjectionWindowHeight);
+});
+
+window.addEventListener('load', () => {
+  const left = document.querySelector('.control-plane-left');
+
+  if (left) {
+    controlPlaneObserver.observe(left);
+  }
+
+  requestAnimationFrame(syncInjectionWindowHeight);
+});

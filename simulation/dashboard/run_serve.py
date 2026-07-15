@@ -10,6 +10,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Optional
 
+USERSPACE_POST_EVENT_LIMIT = 500
+
 CC_NAMES = {
     1: "DCQCN",
     3: "HPCC",
@@ -90,6 +92,18 @@ def parse_config(path: Path):
     schedule_enable = safe_int(cfg.get("OCS_SCHEDULE_ENABLE"), None)
     rnic_gate_enable = safe_int(cfg.get("RNIC_GATE_ENABLE"), 1)
 
+    injection_mode_names = {
+        0: "Default RDMA",
+        1: "RNIC Gate",
+        2: "Userspace Admission",
+    }
+
+    injection_layer_names = {
+        0: "default",
+        1: "rnic",
+        2: "userspace",
+    }
+
     return {
         "raw": cfg,
         "ccMode": cc_code,
@@ -97,6 +111,9 @@ def parse_config(path: Path):
         "ocsMode": "schedule" if schedule_enable == 1 else ("map" if schedule_enable == 0 else "-"),
         "rnicGateEnable": rnic_gate_enable,
         "rnicGateMode": "enabled" if rnic_gate_enable == 1 else "disabled",
+        "injectionMode": rnic_gate_enable,
+        "injectionModeName": injection_mode_names.get(rnic_gate_enable, f"UNKNOWN({rnic_gate_enable})"),
+        "injectionLayer": injection_layer_names.get(rnic_gate_enable, "unknown"),
     }
 
 
@@ -559,6 +576,9 @@ def parse_run_log(path: Path):
     current_table = None
     flow_bytes = []
     rnic_retx = []
+    userspace_posts = []
+    userspace_summaries = []
+    gate_mode_events = []
 
     if not path.exists():
         return {
@@ -588,7 +608,8 @@ def parse_run_log(path: Path):
     )
 
     re_tbl_begin = re.compile(
-        r"\[RNIC QP .*INJECTION TABLE BEGIN\] rnic=(\d+).*?epochNs=(\d+).*?periodNs=(\d+)"
+        r"\[(?:RNIC QP .*INJECTION TABLE|INJECTION WINDOW TABLE) BEGIN\] "
+        r"rnic=(\d+).*?epochNs=(\d+).*?periodNs=(\d+)"
     )
 
     re_win = re.compile(
@@ -625,6 +646,56 @@ def parse_run_log(path: Path):
         r"recover_events=(\d+).*?"
         r"retx_packets=(\d+).*?"
         r"retx_bytes=(\d+)"
+    )
+
+    re_userspace_post = re.compile(
+        r"\[USERSPACE WR POST\].*?"
+        r"t=(\d+).*?"
+        r"src=(\d+).*?"
+        r"dip=([0-9]+)\.([0-9]+).*?"
+        r"sport=(\d+).*?"
+        r"dport=(\d+).*?"
+        r"bytes=(\d+).*?"
+        r"postedLimit=(\d+).*?"
+        r"outstanding=(\d+)"
+        r"(?:.*?safeBudget=(\d+))?"
+        r"(?:.*?windowEnd=(\d+))?"
+    )
+
+    re_userspace_post_sample_node = re.compile(
+        r"\[USERSPACE WR POST(?: SAMPLE)?\].*?"
+        r"t=(\d+).*?"
+        r"src=(\d+).*?"
+        r"dst=(\d+).*?"
+        r"sport=(\d+).*?"
+        r"dport=(\d+).*?"
+        r"bytes=(\d+).*?"
+        r"postedLimit=(\d+).*?"
+        r"outstanding=(\d+)"
+        r"(?:.*?safeBudget=(\d+))?"
+        r"(?:.*?windowEnd=(\d+))?"
+    )
+
+    re_userspace_summary = re.compile(
+        r"\[USERSPACE WR SUMMARY\].*?"
+        r"t=(\d+).*?"
+        r"src=(\d+).*?"
+        r"dst=(\d+).*?"
+        r"sport=(\d+).*?"
+        r"dport=(\d+).*?"
+        r"pg=(\d+).*?"
+        r"posts=(\d+).*?"
+        r"total_bytes=(\d+).*?"
+        r"min_bytes=(\d+).*?"
+        r"max_bytes=(\d+).*?"
+        r"avg_bytes=(\d+).*?"
+        r"first_post=(\d+).*?"
+        r"last_post=(\d+).*?"
+        r"safe_budget_limited=(\d+)"
+    )
+
+    re_gate_mode = re.compile(
+        r"\[RDMA GATE MODE\]\s+mode=(\d+)\s+layer=([A-Za-z0-9_\-]+)"
     )
 
     for line in path.read_text(errors="ignore").splitlines():
@@ -673,7 +744,8 @@ def parse_run_log(path: Path):
             injection_tables.append(current_table)
             continue
 
-        if "INJECTION TABLE END" in line:
+        if ("INJECTION TABLE END" in line or
+            "INJECTION WINDOW TABLE END" in line):
             current_table = None
             continue
 
@@ -725,6 +797,67 @@ def parse_run_log(path: Path):
                 "retxPackets": int(m.group(9)),
                 "retxBytes": int(m.group(10)),
             })
+            continue
+
+        m = re_userspace_summary.search(line)
+        if m:
+            userspace_summaries.append({
+                "timeNs": int(m.group(1)),
+                "src": int(m.group(2)),
+                "dst": int(m.group(3)),
+                "sport": int(m.group(4)),
+                "dport": int(m.group(5)),
+                "pg": int(m.group(6)),
+                "postCount": int(m.group(7)),
+                "totalBytes": int(m.group(8)),
+                "minBytes": int(m.group(9)),
+                "maxBytes": int(m.group(10)),
+                "avgBytes": int(m.group(11)),
+                "firstPostTimeNs": int(m.group(12)),
+                "lastPostTimeNs": int(m.group(13)),
+                "safeBudgetLimitedCount": int(m.group(14)),
+            })
+            continue
+
+        m = re_userspace_post_sample_node.search(line)
+        if m:
+            userspace_posts.append({
+                "timeNs": int(m.group(1)),
+                "src": int(m.group(2)),
+                "dst": int(m.group(3)),
+                "sport": int(m.group(4)),
+                "dport": int(m.group(5)),
+                "bytes": int(m.group(6)),
+                "postedLimit": int(m.group(7)),
+                "outstanding": int(m.group(8)),
+                "safeBudget": int(m.group(9)) if m.group(9) is not None else None,
+                "windowEnd": int(m.group(10)) if m.group(10) is not None else None,
+            })
+            continue
+
+        m = re_userspace_post.search(line)
+        if m:
+            userspace_posts.append({
+                "timeNs": int(m.group(1)),
+                "src": int(m.group(2)),
+                "dst": int(m.group(4)),
+                "sport": int(m.group(5)),
+                "dport": int(m.group(6)),
+                "bytes": int(m.group(7)),
+                "postedLimit": int(m.group(8)),
+                "outstanding": int(m.group(9)),
+                "safeBudget": int(m.group(10)) if m.group(10) is not None else None,
+                "windowEnd": int(m.group(11)) if m.group(11) is not None else None,
+            })
+            continue
+
+        m = re_gate_mode.search(line)
+        if m:
+            gate_mode_events.append({
+                "mode": int(m.group(1)),
+                "layer": m.group(2),
+            })
+            continue
 
     return {
         "ocsStats": stats,
@@ -734,6 +867,13 @@ def parse_run_log(path: Path):
         "flowBytes": flow_bytes,
         "rnicRetx": rnic_retx,
         "rnicRetxByRnic": aggregate_rnic_retx(rnic_retx),
+        "userspacePosts": userspace_posts[:USERSPACE_POST_EVENT_LIMIT],
+        "userspacePostSummary": aggregate_userspace_summary_rows(userspace_summaries) if userspace_summaries else aggregate_userspace_posts(userspace_posts),
+        "userspacePostByFlow": userspace_summaries if userspace_summaries else aggregate_userspace_posts_by_flow(userspace_posts),
+        "userspacePostEventLimit": USERSPACE_POST_EVENT_LIMIT,
+        "userspacePostTotalEvents": sum(x.get("postCount", 0) for x in userspace_summaries) if userspace_summaries else len(userspace_posts),
+        "userspacePostSampleCount": len(userspace_posts),
+        "gateModeEvents": gate_mode_events,
     }
 
 def aggregate_rnic_retx(rnic_retx):
@@ -757,6 +897,128 @@ def aggregate_rnic_retx(rnic_retx):
         agg[rnic]["flows"] += 1
 
     return sorted(agg.values(), key=lambda x: x["rnic"])
+
+def aggregate_userspace_posts(posts):
+    if not posts:
+        return {
+            "count": 0,
+            "totalBytes": 0,
+            "minBytes": None,
+            "maxBytes": None,
+            "avgBytes": None,
+            "firstPostTimeNs": None,
+            "lastPostTimeNs": None,
+            "safeBudgetLimitedCount": 0,
+        }
+
+    sizes = [p.get("bytes", 0) for p in posts]
+    safe_limited = 0
+
+    for p in posts:
+        safe_budget = p.get("safeBudget")
+        size = p.get("bytes")
+
+        if safe_budget is not None and size is not None and size >= safe_budget:
+            safe_limited += 1
+
+    return {
+        "count": len(posts),
+        "totalBytes": sum(sizes),
+        "minBytes": min(sizes),
+        "maxBytes": max(sizes),
+        "avgBytes": sum(sizes) / len(sizes),
+        "firstPostTimeNs": min(p.get("timeNs", 0) for p in posts),
+        "lastPostTimeNs": max(p.get("timeNs", 0) for p in posts),
+        "safeBudgetLimitedCount": safe_limited,
+    }
+
+
+def aggregate_userspace_summary_rows(rows):
+    if not rows:
+        return {
+            "count": 0,
+            "totalBytes": 0,
+            "minBytes": None,
+            "maxBytes": None,
+            "avgBytes": None,
+            "firstPostTimeNs": None,
+            "lastPostTimeNs": None,
+            "safeBudgetLimitedCount": 0,
+        }
+
+    total_posts = sum(r.get("postCount", 0) for r in rows)
+    total_bytes = sum(r.get("totalBytes", 0) for r in rows)
+    min_values = [r.get("minBytes") for r in rows if r.get("minBytes") is not None]
+    max_values = [r.get("maxBytes") for r in rows if r.get("maxBytes") is not None]
+    first_values = [r.get("firstPostTimeNs") for r in rows if r.get("firstPostTimeNs") is not None]
+    last_values = [r.get("lastPostTimeNs") for r in rows if r.get("lastPostTimeNs") is not None]
+
+    return {
+        "count": total_posts,
+        "totalBytes": total_bytes,
+        "minBytes": min(min_values) if min_values else None,
+        "maxBytes": max(max_values) if max_values else None,
+        "avgBytes": total_bytes / total_posts if total_posts else None,
+        "firstPostTimeNs": min(first_values) if first_values else None,
+        "lastPostTimeNs": max(last_values) if last_values else None,
+        "safeBudgetLimitedCount": sum(r.get("safeBudgetLimitedCount", 0) for r in rows),
+    }
+
+
+def aggregate_userspace_posts_by_flow(posts):
+    agg = {}
+
+    for p in posts:
+        key = (
+            p.get("src"),
+            p.get("dst"),
+            p.get("sport"),
+            p.get("dport"),
+        )
+
+        if key not in agg:
+            agg[key] = {
+                "src": p.get("src"),
+                "dst": p.get("dst"),
+                "sport": p.get("sport"),
+                "dport": p.get("dport"),
+                "postCount": 0,
+                "totalBytes": 0,
+                "minBytes": None,
+                "maxBytes": None,
+                "firstPostTimeNs": None,
+                "lastPostTimeNs": None,
+                "safeBudgetLimitedCount": 0,
+            }
+
+        row = agg[key]
+        size = p.get("bytes", 0)
+        t = p.get("timeNs", 0)
+
+        row["postCount"] += 1
+        row["totalBytes"] += size
+        row["minBytes"] = size if row["minBytes"] is None else min(row["minBytes"], size)
+        row["maxBytes"] = size if row["maxBytes"] is None else max(row["maxBytes"], size)
+        row["firstPostTimeNs"] = t if row["firstPostTimeNs"] is None else min(row["firstPostTimeNs"], t)
+        row["lastPostTimeNs"] = t if row["lastPostTimeNs"] is None else max(row["lastPostTimeNs"], t)
+
+        safe_budget = p.get("safeBudget")
+        if safe_budget is not None and size >= safe_budget:
+            row["safeBudgetLimitedCount"] += 1
+
+    out = []
+
+    for row in agg.values():
+        row["avgBytes"] = row["totalBytes"] / row["postCount"] if row["postCount"] else None
+        out.append(row)
+
+    return sorted(out, key=lambda x: (
+        x.get("src") if x.get("src") is not None else 1 << 30,
+        x.get("dst") if x.get("dst") is not None else 1 << 30,
+        x.get("sport") if x.get("sport") is not None else -1,
+        x.get("dport") if x.get("dport") is not None else -1,
+    ))
+
 
 def _flow_tuple_key(src, dst, sport, dport, pg):
     return (int(src), int(dst), int(sport), int(dport), int(pg))
@@ -984,6 +1246,12 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
     total_retx_bytes = sum(x.get("retxBytes", 0) for x in rnic_retx_by_rnic)
     total_recover_events = sum(x.get("recoverEvents", 0) for x in rnic_retx_by_rnic)
 
+    userspace_post_summary = log.get("userspacePostSummary", {})
+
+    observed_gate_mode = None
+    if log.get("gateModeEvents"):
+        observed_gate_mode = log["gateModeEvents"][-1]
+
     summary = {
         "nodeCount": rnic_count,
         "totalNodeCount": topology.get("totalNodes", 0),
@@ -997,9 +1265,22 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
         "fctCount": len(fct),
         "maxFctNs": max([x.get("fct_ns", 0) for x in fct], default=0),
         "rnicGateMode": config.get("rnicGateMode", "-"),
+        "injectionMode": config.get("injectionMode"),
+        "injectionModeName": config.get("injectionModeName", "-"),
+        "injectionLayer": config.get("injectionLayer", "-"),
+        "observedInjectionMode": observed_gate_mode.get("mode") if observed_gate_mode else None,
+        "observedInjectionLayer": observed_gate_mode.get("layer") if observed_gate_mode else None,
         "totalRecoverEvents": total_recover_events,
         "totalRetxPackets": total_retx_packets,
         "totalRetxBytes": total_retx_bytes,
+        "userspacePostCount": userspace_post_summary.get("count", 0),
+        "userspacePostBytes": userspace_post_summary.get("totalBytes", 0),
+        "userspaceAvgPostBytes": userspace_post_summary.get("avgBytes"),
+        "userspaceMinPostBytes": userspace_post_summary.get("minBytes"),
+        "userspaceMaxPostBytes": userspace_post_summary.get("maxBytes"),
+        "userspaceFirstPostTimeNs": userspace_post_summary.get("firstPostTimeNs"),
+        "userspaceLastPostTimeNs": userspace_post_summary.get("lastPostTimeNs"),
+        "userspaceSafeBudgetLimitedCount": userspace_post_summary.get("safeBudgetLimitedCount", 0),
     }
 
     if schedule.get("mode") == "map":

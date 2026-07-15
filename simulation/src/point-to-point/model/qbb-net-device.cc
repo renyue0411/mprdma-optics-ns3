@@ -46,7 +46,6 @@
 #include "ns3/seq-ts-header.h"
 #include "ns3/pointer.h"
 #include "ns3/custom-header.h"
-#include "ns3/rdma-transport-control.h"
 
 #include <iostream>
 
@@ -99,14 +98,88 @@ namespace ns3
 	int RdmaEgressQueue::GetNextQindex(bool paused[])
 	{
 		m_nextGateWake = Simulator::GetMaximumSimulationTime();
-		return RdmaTransportControl::GetNextQindex(m_qpGrp,
-										m_ackQ,
-										paused,
-										ack_q_idx,
-										m_rrlast,
-										m_rdmaGateAllowQp,
-										m_rdmaGateNextTime,
-										&m_nextGateWake);
+
+		if (!paused[ack_q_idx] && m_ackQ->GetNPackets() > 0)
+		{
+			return -1;
+		}
+
+		// No packet in the highest priority queue.
+		// Do round-robin across RDMA QPs.
+		int res = -1024;
+		uint32_t fcount = m_qpGrp->GetN();
+		uint32_t minFinishId = 0xffffffff;
+
+		for (uint32_t qIndex = 1; qIndex <= fcount; qIndex++)
+		{
+			uint32_t idx = (qIndex + m_rrlast) % fcount;
+			Ptr<RdmaQueuePair> qp = m_qpGrp->Get(idx);
+
+			if (!paused[qp->m_pg] &&
+				qp->GetBytesLeft() > 0 &&
+				!qp->IsWinBound())
+			{
+				if (qp->m_nextAvail.GetTimeStep() >
+					Simulator::Now().GetTimeStep())
+				{
+					continue;
+				}
+
+				if (!m_rdmaGateAllowQp.IsNull() &&
+					!m_rdmaGateAllowQp(qp))
+				{
+					if (!m_rdmaGateNextTime.IsNull())
+					{
+						Time t = m_rdmaGateNextTime(qp);
+						if (t > Simulator::Now() &&
+							t < m_nextGateWake)
+						{
+							m_nextGateWake = t;
+						}
+					}
+
+					continue;
+				}
+
+				res = idx;
+				break;
+			}
+			else if (qp->IsFinished())
+			{
+				minFinishId =
+					idx < minFinishId
+						? idx
+						: minFinishId;
+			}
+		}
+
+		// Clear finished QPs.
+		// This preserves the original behavior in qbb-net-device.cc.
+		if (minFinishId < 0xffffffff)
+		{
+			int nxt = minFinishId;
+			auto &qps = m_qpGrp->m_qps;
+
+			for (int i = minFinishId + 1;
+				i < static_cast<int>(fcount);
+				i++)
+			{
+				if (!qps[i]->IsFinished())
+				{
+					if (i == res)
+					{
+						res = nxt;
+					}
+
+					qps[nxt] = qps[i];
+					nxt++;
+				}
+			}
+
+			qps.resize(nxt);
+		}
+
+		return res;
 	}
 
 	Time RdmaEgressQueue::GetNextGateWake(void) const

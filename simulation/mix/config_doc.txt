@@ -3,12 +3,18 @@ USE_DYNAMIC_PFC_THRESHOLD 1 {0: disable, 1: enable}
 
 PACKET_PAYLOAD_SIZE 1000 {packet size (bytes)}
 
-TOPOLOGY_FILE mix/topology.txt {input file: topoology}
-FLOW_FILE mix/flow.txt {input file: flow to generate}
-TRACE_FILE mix/trace.txt {input file: nodes to monitor packet-level events (enqu, dequ, pfc, etc.), will be dumped to TRACE_OUTPUT_FILE}
-TRACE_OUTPUT_FILE mix/mix.tr {output file: packet-level events (enqu, dequ, pfc, etc.)}
-FCT_OUTPUT_FILE mix/fct.txt {output file: flow completion time of different flows}
-PFC_OUTPUT_FILE mix/pfc.txt {output file: result of PFC}
+TOPOLOGY_FILE       mix/topology.txt {input file: topoology}
+TOPOLOGY_FORMAT     compact_ocs_ports {topology parser mode; options: auto, legacy, with_ocs_ports, compact_ocs_ports; use compact_ocs_ports for OCS/EPS hybrid topologies where only links connected to OCS nodes include OCS logical port IDs}
+FLOW_FILE           mix/flow.txt {input file: flow to generate}
+TRACE_FILE          mix/trace.txt {input file: nodes to monitor packet-level events (enqu, dequ, pfc, etc.), will be dumped to TRACE_OUTPUT_FILE}
+TRACE_OUTPUT_FILE   mix/mix.tr {output file: packet-level events (enqu, dequ, pfc, etc.)}
+FCT_OUTPUT_FILE     mix/fct.txt {output file: flow completion time of different flows}
+PFC_OUTPUT_FILE     mix/pfc.txt {output file: result of PFC}
+
+RNIC_GATE_ENABLE    {0: default RDMA; 1: RNIC-side injection gate; 2: userspace middleware injection control}
+OCS_SCHEDULE_ENABLE     {enable OCS schedule; 0: disabled, use map, 1: enabled}
+OCS_MAP_FILE            {OCS map file}
+OCS_SCHEDULE_FILE       {OCS schedule file}
 
 SIMULATOR_STOP_TIME 4.00 {simulation stop time}
 

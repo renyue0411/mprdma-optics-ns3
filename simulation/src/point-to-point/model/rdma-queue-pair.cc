@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <ns3/hash.h>
 #include <ns3/uinteger.h>
 #include <ns3/seq-ts-header.h>
@@ -31,8 +32,6 @@ namespace ns3
 		dip = _dip;
 		sport = _sport;
 		dport = _dport;
-		m_size = 0;
-		snd_nxt = snd_una = 0;
 		m_pg = pg;
 		m_ipid = 0;
 		m_win = 0;
@@ -41,6 +40,10 @@ namespace ns3
 		m_var_win = false;
 		m_rate = 0;
 		m_nextAvail = Time(0);
+
+		m_size = 0;
+		m_postedLimit = 0;
+		snd_nxt = snd_una = 0;
 
 		m_maxSeqSent = 0;
 		m_retxPackets = 0;
@@ -85,6 +88,52 @@ namespace ns3
 		m_size = size;
 	}
 
+	void
+	RdmaQueuePair::SetPostedLimit(uint64_t limit)
+	{
+		NS_ASSERT_MSG(limit <= m_size,
+					"posted limit exceeds total flow size");
+
+		NS_ASSERT_MSG(limit >= snd_nxt,
+					"posted limit cannot be lower than snd_nxt");
+
+		m_postedLimit = limit;
+	}
+
+	void
+	RdmaQueuePair::AddPostedBytes(uint64_t bytes)
+	{
+		NS_ASSERT_MSG(m_postedLimit <= m_size,
+					"invalid posted limit");
+
+		uint64_t remaining = m_size - m_postedLimit;
+		uint64_t admitted = std::min(bytes, remaining);
+
+		m_postedLimit += admitted;
+	}
+
+	uint64_t
+	RdmaQueuePair::GetPostedLimit() const
+	{
+		return m_postedLimit;
+	}
+
+	uint64_t
+	RdmaQueuePair::GetUnpostedBytes() const
+	{
+		return m_size > m_postedLimit
+			? m_size - m_postedLimit
+			: 0;
+	}
+
+	uint64_t
+	RdmaQueuePair::GetPostedOutstandingBytes() const
+	{
+		return m_postedLimit > snd_una
+			? m_postedLimit - snd_una
+			: 0;
+	}
+
 	void RdmaQueuePair::SetWin(uint32_t win)
 	{
 		m_win = win;
@@ -109,9 +158,12 @@ namespace ns3
 	 * This function calculates and returns the number of
 	 * bytes left to be sent.
 	 *****************************************************/
-	uint64_t RdmaQueuePair::GetBytesLeft()
+	uint64_t
+	RdmaQueuePair::GetBytesLeft()
 	{
-		return m_size >= snd_nxt ? m_size - snd_nxt : 0;
+		return m_postedLimit > snd_nxt
+			? m_postedLimit - snd_nxt
+			: 0;
 	}
 
 	/******************************************************

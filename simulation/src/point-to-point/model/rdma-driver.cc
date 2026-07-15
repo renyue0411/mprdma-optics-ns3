@@ -16,9 +16,9 @@ namespace ns3
 	}
 
 	RdmaDriver::RdmaDriver()
+		: m_injectionMode(INJECTION_DEFAULT)
 	{
 	}
-
 	void RdmaDriver::Init(void)
 	{
 		Ptr<Ipv4> ipv4 = m_node->GetObject<Ipv4>();
@@ -53,6 +53,23 @@ namespace ns3
 		// RdmaHw do setup
 		m_rdma->SetNode(m_node);
 		m_rdma->Setup(MakeCallback(&RdmaDriver::QpComplete, this));
+		m_userspaceTransport =
+			CreateObject<RdmaUserspaceTransport>();
+
+		m_userspaceTransport->SetNode(m_node);
+		m_userspaceTransport->SetRdmaHw(m_rdma);
+
+		m_rdma->SetQpProgressCallback(
+			MakeCallback(
+				&RdmaUserspaceTransport::
+					NotifyAckProgress,
+				m_userspaceTransport));
+
+		m_rdma->SetQpRecoverCallback(
+			MakeCallback(
+				&RdmaUserspaceTransport::
+					NotifyRecover,
+				m_userspaceTransport));
 	}
 
 	void RdmaDriver::SetNode(Ptr<Node> node)
@@ -65,14 +82,90 @@ namespace ns3
 		m_rdma = rdma;
 	}
 
-	void RdmaDriver::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish)
+	void
+	RdmaDriver::AddQueuePair(
+		uint64_t size,
+		uint16_t pg,
+		Ipv4Address sip,
+		Ipv4Address dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint32_t win,
+		uint64_t baseRtt,
+		Callback<void> notifyAppFinish)
 	{
-		m_rdma->AddQueuePair(size, pg, sip, dip, sport, dport, win, baseRtt, notifyAppFinish);
+		if (m_injectionMode == INJECTION_USERSPACE)
+		{
+			Ptr<RdmaQueuePair> qp =
+				m_rdma->CreateQueuePair(
+					size,
+					pg,
+					sip,
+					dip,
+					sport,
+					dport,
+					win,
+					baseRtt,
+					notifyAppFinish,
+					0);
+
+			m_userspaceTransport->RegisterQp(qp);
+			return;
+		}
+
+		m_rdma->AddQueuePair(
+			size,
+			pg,
+			sip,
+			dip,
+			sport,
+			dport,
+			win,
+			baseRtt,
+			notifyAppFinish);
 	}
 
 	void RdmaDriver::QpComplete(Ptr<RdmaQueuePair> q)
 	{
 		m_traceQpComplete(q);
+	}
+
+	void
+	RdmaDriver::SetInjectionMode(uint32_t mode)
+	{
+		NS_ASSERT_MSG(mode <= INJECTION_USERSPACE,
+					"injection mode must be 0, 1, or 2");
+
+		m_injectionMode = mode;
+
+		if (m_userspaceTransport != NULL)
+		{
+			m_userspaceTransport->SetEnabled(
+				mode == INJECTION_USERSPACE);
+		}
+
+		if (mode != INJECTION_RNIC)
+		{
+			m_rdma->DisableRnicGate();
+		}
+	}
+
+	void
+	RdmaDriver::ConfigureUserspaceTransport(
+		uint64_t wrChunkBytes,
+		uint64_t maxOutstandingBytes)
+	{
+		NS_ASSERT(m_userspaceTransport != NULL);
+
+		m_userspaceTransport->Configure(
+			wrChunkBytes,
+			maxOutstandingBytes);
+	}
+
+	Ptr<RdmaUserspaceTransport>
+	RdmaDriver::GetUserspaceTransport() const
+	{
+		return m_userspaceTransport;
 	}
 
 } // namespace ns3

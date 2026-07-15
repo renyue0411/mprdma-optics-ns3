@@ -293,6 +293,18 @@ namespace
 		m_qpCompleteCallback = cb;
 	}
 
+	void
+	RdmaHw::SetQpProgressCallback(QpProgressCallback cb)
+	{
+		m_qpProgressCallback = cb;
+	}
+
+	void
+	RdmaHw::SetQpRecoverCallback(QpRecoverCallback cb)
+	{
+		m_qpRecoverCallback = cb;
+	}
+
 	void RdmaHw::EnableRnicGate(uint32_t rnicId, uint64_t epochStartNs, uint64_t periodNs, const std::vector<RnicGateSlotEntry> &slots)
 	{
 		m_rnicGateEnabled = true;
@@ -424,11 +436,24 @@ namespace
 			return it->second;
 		return NULL;
 	}
-	void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish)
+	Ptr<RdmaQueuePair>
+	RdmaHw::CreateQueuePair(
+		uint64_t size,
+		uint16_t pg,
+		Ipv4Address sip,
+		Ipv4Address dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint32_t win,
+		uint64_t baseRtt,
+		Callback<void> notifyAppFinish,
+		uint64_t initialPostedBytes)
 	{
+		NS_ASSERT_MSG(initialPostedBytes <= size, "initial posted bytes exceed flow size");
 		// create qp
 		Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
 		qp->SetSize(size);
+		qp->SetPostedLimit(initialPostedBytes);
 		qp->SetWin(win);
 		qp->SetBaseRtt(baseRtt);
 		qp->SetVarWin(m_var_win);
@@ -467,7 +492,68 @@ namespace
 		}
 
 		// Notify Nic
-		m_nic[nic_idx].dev->NewQp(qp);
+		if (initialPostedBytes > 0)
+		{
+			m_nic[nic_idx].dev->NewQp(qp);
+		}
+
+		return qp;
+	}
+
+	void
+	RdmaHw::AddQueuePair(
+		uint64_t size,
+		uint16_t pg,
+		Ipv4Address sip,
+		Ipv4Address dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint32_t win,
+		uint64_t baseRtt,
+		Callback<void> notifyAppFinish)
+	{
+		CreateQueuePair(
+			size,
+			pg,
+			sip,
+			dip,
+			sport,
+			dport,
+			win,
+			baseRtt,
+			notifyAppFinish,
+			size);
+	}
+
+	void
+	RdmaHw::PostWork(
+		Ptr<RdmaQueuePair> qp,
+		uint64_t bytes)
+	{
+		if (qp == NULL || bytes == 0)
+		{
+			return;
+		}
+
+		uint64_t oldLimit = qp->GetPostedLimit();
+
+		qp->AddPostedBytes(bytes);
+
+		uint64_t newLimit = qp->GetPostedLimit();
+
+		if (newLimit == oldLimit)
+		{
+			return;
+		}
+
+		NS_ASSERT(qp->snd_una <= qp->snd_nxt);
+		NS_ASSERT(qp->snd_nxt <= qp->GetPostedLimit());
+		NS_ASSERT(qp->GetPostedLimit() <= qp->m_size);
+
+		uint32_t nicIdx = GetNicIdxOfQp(qp);
+
+		// Simulates ibv_post_send + doorbell notification.
+		m_nic[nicIdx].dev->NewQp(qp);
 	}
 
 	void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp)
@@ -659,6 +745,11 @@ namespace
 				uint32_t goback_seq = seq / m_chunk * m_chunk;
 				qp->Acknowledge(goback_seq);
 			}
+			if (ch.l3Prot == 0xFC &&
+				!m_qpProgressCallback.IsNull())
+			{
+				m_qpProgressCallback(qp);
+			}
 			if (qp->IsFinished())
 			{
 				QpComplete(qp);
@@ -837,6 +928,11 @@ namespace
 					<< " snd_una=" << oldSndUna
 					<< " recover_events=" << qp->m_recoverEvents
 					<< std::endl;
+
+			if (!m_qpRecoverCallback.IsNull())
+			{
+				m_qpRecoverCallback(qp);
+			}
 		}
 
 		qp->snd_nxt = qp->snd_una;

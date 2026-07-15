@@ -4,12 +4,14 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 PACKET_PAYLOAD_SIZE 1000
 
 TOPOLOGY_FILE mix/01-ocs_topology.txt
+TOPOLOGY_FORMAT compact_ocs_ports
 FLOW_FILE mix/03-flow.txt
 TRACE_FILE mix/trace_no_ocs.txt
 FCT_OUTPUT_FILE mix/ocs_fct.txt
 TRACE_OUTPUT_FILE mix/ocs.tr
 PFC_OUTPUT_FILE mix/pfc.txt
 
+RNIC_GATE_ENABLE                2
 OCS_SCHEDULE_ENABLE     1
 OCS_MAP_FILE            mix/04-ocs_map.txt
 OCS_SCHEDULE_FILE       mix/05-ocs_schedule.txt
@@ -17,7 +19,7 @@ OCS_SCHEDULE_FILE       mix/05-ocs_schedule.txt
 ENABLE_TRACE 1
 SIMULATOR_STOP_TIME 500.00
 
-CC_MODE 3
+CC_MODE 1
 ALPHA_RESUME_INTERVAL 1
 RATE_DECREASE_INTERVAL 4
 CLAMP_TARGET_RATE 0

@@ -16,6 +16,7 @@
 #include <functional>
 #include "ns3/rdma-driver.h"
 #include "ns3/rdma-hw.h"
+#include "ns3/rdma-userspace-transport.h"
 
 namespace ns3 {
 
@@ -1719,7 +1720,7 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
           entries = tableIt->second.size ();
         }
 
-      std::cout << "[RNIC QP INJECTION TABLE BEGIN] rnic=" << rnic
+      std::cout << "[INJECTION WINDOW TABLE BEGIN] rnic=" << rnic
                 << " epochNs=0";
 
       if (periodNs > 0)
@@ -1786,7 +1787,7 @@ RdmaOcsController::DumpRnicReachabilityWindows () const
             }
         }
 
-      std::cout << "[RNIC QP INJECTION TABLE END] rnic=" << rnic
+      std::cout << "[INJECTION WINDOW TABLE END] rnic=" << rnic
                 << std::endl;
     }
 }
@@ -1985,11 +1986,17 @@ RdmaOcsController::InstallRnicGateTablesToRdmaHw () const
         }
 
       Ptr<Node> node = m_nodes.Get (rnic);
-      Ptr<RdmaDriver> rdmaDriver = node->GetObject<RdmaDriver> ();
+      Ptr<RdmaDriver> rdmaDriver =
+        node->GetObject<RdmaDriver> ();
+
       if (rdmaDriver == 0 || rdmaDriver->m_rdma == 0)
         {
-          std::cout << "[RNIC GATE INSTALL SKIP] rnic=" << rnic
-                    << " reason=no_rdma_hw" << std::endl;
+          std::cout
+            << "[RNIC GATE INSTALL SKIP]"
+            << " rnic=" << rnic
+            << " reason=no_rdma_hw"
+            << std::endl;
+
           continue;
         }
 
@@ -2005,9 +2012,255 @@ RdmaOcsController::InstallRnicGateTablesToRdmaHw () const
           hwSlots.push_back (hwSlot);
         }
 
-      rdmaDriver->m_rdma->EnableRnicGate (rnic, 0, periodNs, hwSlots);
+      rdmaDriver->m_rdma->EnableRnicGate(
+          rnic,
+          0,
+          periodNs,
+          hwSlots);
     }
 }
 
+void
+RdmaOcsController::InstallRnicGateTablesToUserspace () const
+{
+  struct GateSlot
+  {
+    uint64_t startOffsetNs;
+    uint64_t endOffsetNs;
+    uint64_t periodNs;
+    std::vector<uint64_t> bitmapWords;
+  };
+
+  std::vector<uint32_t> allRnicNodes;
+  for (std::map<uint32_t, uint32_t>::const_iterator it =
+         m_nodeToRnicGroup.begin ();
+       it != m_nodeToRnicGroup.end ();
+       ++it)
+    {
+      allRnicNodes.push_back (it->first);
+    }
+  std::sort (allRnicNodes.begin (), allRnicNodes.end ());
+
+  uint32_t bitmapWordCount = static_cast<uint32_t> ((m_nodes.GetN () + 63) / 64);
+  if (bitmapWordCount == 0)
+    {
+      bitmapWordCount = 1;
+    }
+
+  std::map<uint32_t, std::vector<GateSlot> > tables;
+
+  for (uint32_t i = 0; i < m_rnicReachabilityWindows.size (); ++i)
+    {
+      const RnicReachabilityWindow &w = m_rnicReachabilityWindows[i];
+
+      std::map<uint32_t, RnicGroup>::const_iterator srcGroupIt =
+        m_rnicGroups.find (w.srcGroup);
+      std::map<uint32_t, RnicGroup>::const_iterator dstGroupIt =
+        m_rnicGroups.find (w.dstGroup);
+
+      NS_ASSERT_MSG (srcGroupIt != m_rnicGroups.end (),
+                     "RNIC window points to an unknown source group");
+      NS_ASSERT_MSG (dstGroupIt != m_rnicGroups.end (),
+                     "RNIC window points to an unknown destination group");
+
+      const RnicGroup &srcGroup = srcGroupIt->second;
+      const RnicGroup &dstGroup = dstGroupIt->second;
+
+      uint64_t startOffsetNs = static_cast<uint64_t> (w.startOffset.GetNanoSeconds ());
+      uint64_t endOffsetNs = static_cast<uint64_t> (w.endOffset.GetNanoSeconds ());
+      uint64_t periodNs = static_cast<uint64_t> (w.period.GetNanoSeconds ());
+
+      for (uint32_t s = 0; s < srcGroup.rnicNodes.size (); ++s)
+        {
+          uint32_t srcRnic = srcGroup.rnicNodes[s];
+          std::vector<GateSlot> &slots = tables[srcRnic];
+
+          GateSlot *slot = 0;
+          for (uint32_t k = 0; k < slots.size (); ++k)
+            {
+              if (slots[k].startOffsetNs == startOffsetNs &&
+                  slots[k].endOffsetNs == endOffsetNs &&
+                  slots[k].periodNs == periodNs)
+                {
+                  slot = &slots[k];
+                  break;
+                }
+            }
+
+          if (slot == 0)
+            {
+              GateSlot newSlot;
+              newSlot.startOffsetNs = startOffsetNs;
+              newSlot.endOffsetNs = endOffsetNs;
+              newSlot.periodNs = periodNs;
+              newSlot.bitmapWords.assign (bitmapWordCount, 0);
+              slots.push_back (newSlot);
+              slot = &slots.back ();
+            }
+
+          for (uint32_t d = 0; d < dstGroup.rnicNodes.size (); ++d)
+            {
+              uint32_t dstRnic = dstGroup.rnicNodes[d];
+              if (dstRnic == srcRnic)
+                {
+                  continue;
+                }
+
+              uint32_t wordIndex = dstRnic / 64;
+              uint32_t bitIndex = dstRnic % 64;
+              NS_ASSERT_MSG (wordIndex < slot->bitmapWords.size (),
+                             "RNIC bitmap word index out of range");
+              slot->bitmapWords[wordIndex] |= (1ULL << bitIndex);
+            }
+        }
+    }
+
+  /*
+   * Install only disjoint slots.  This mirrors the dump normalization above
+   * and makes the hardware gate lookup independent of slot iteration order.
+   */
+  for (std::map<uint32_t, std::vector<GateSlot> >::iterator it =
+         tables.begin ();
+       it != tables.end ();
+       ++it)
+    {
+      std::vector<GateSlot> rawSlots = it->second;
+      std::vector<uint64_t> boundaries;
+
+      for (uint32_t k = 0; k < rawSlots.size (); ++k)
+        {
+          if (rawSlots[k].endOffsetNs <= rawSlots[k].startOffsetNs)
+            {
+              continue;
+            }
+          boundaries.push_back (rawSlots[k].startOffsetNs);
+          boundaries.push_back (rawSlots[k].endOffsetNs);
+        }
+
+      std::sort (boundaries.begin (), boundaries.end ());
+      boundaries.erase (std::unique (boundaries.begin (), boundaries.end ()),
+                        boundaries.end ());
+
+      std::vector<GateSlot> normalizedSlots;
+      for (uint32_t b = 0; b + 1 < boundaries.size (); ++b)
+        {
+          uint64_t startOffsetNs = boundaries[b];
+          uint64_t endOffsetNs = boundaries[b + 1];
+
+          if (endOffsetNs <= startOffsetNs)
+            {
+              continue;
+            }
+
+          GateSlot slot;
+          slot.startOffsetNs = startOffsetNs;
+          slot.endOffsetNs = endOffsetNs;
+          slot.periodNs = 0;
+          slot.bitmapWords.assign (bitmapWordCount, 0);
+
+          for (uint32_t k = 0; k < rawSlots.size (); ++k)
+            {
+              const GateSlot &raw = rawSlots[k];
+              if (raw.startOffsetNs <= startOffsetNs &&
+                  endOffsetNs <= raw.endOffsetNs)
+                {
+                  slot.periodNs = raw.periodNs;
+                  for (uint32_t w = 0; w < slot.bitmapWords.size (); ++w)
+                    {
+                      slot.bitmapWords[w] |= raw.bitmapWords[w];
+                    }
+                }
+            }
+
+          bool hasDst = false;
+          for (uint32_t w = 0; w < slot.bitmapWords.size (); ++w)
+            {
+              if (slot.bitmapWords[w] != 0)
+                {
+                  hasDst = true;
+                  break;
+                }
+            }
+
+          if (!hasDst)
+            {
+              continue;
+            }
+
+          if (!normalizedSlots.empty () &&
+              normalizedSlots.back ().endOffsetNs == slot.startOffsetNs &&
+              normalizedSlots.back ().periodNs == slot.periodNs &&
+              normalizedSlots.back ().bitmapWords == slot.bitmapWords)
+            {
+              normalizedSlots.back ().endOffsetNs = slot.endOffsetNs;
+            }
+          else
+            {
+              normalizedSlots.push_back (slot);
+            }
+        }
+
+      it->second = normalizedSlots;
+    }
+
+  for (uint32_t i = 0; i < allRnicNodes.size (); ++i)
+    {
+      uint32_t rnic = allRnicNodes[i];
+      std::map<uint32_t, std::vector<GateSlot> >::const_iterator tableIt =
+        tables.find (rnic);
+      if (tableIt == tables.end () || tableIt->second.empty ())
+        {
+          continue;
+        }
+
+      Ptr<Node> node = m_nodes.Get(rnic);
+
+      Ptr<RdmaDriver> rdmaDriver =
+          node->GetObject<RdmaDriver>();
+
+      if (rdmaDriver == 0)
+      {
+          std::cout
+              << "[USERSPACE GATE INSTALL SKIP]"
+              << " rnic=" << rnic
+              << " reason=no_rdma_driver"
+              << std::endl;
+
+          continue;
+      }
+
+      Ptr<RdmaUserspaceTransport> transport =
+        rdmaDriver->GetUserspaceTransport ();
+
+      if (transport == 0)
+        {
+          std::cout
+            << "[USERSPACE GATE INSTALL SKIP]"
+            << " rnic=" << rnic
+            << " reason=no_userspace_transport"
+            << std::endl;
+
+          continue;
+        }
+
+      std::vector<RdmaHw::RnicGateSlotEntry> hwSlots;
+      uint64_t periodNs = tableIt->second[0].periodNs;
+      const std::vector<GateSlot> &slots = tableIt->second;
+      for (uint32_t k = 0; k < slots.size (); ++k)
+        {
+          RdmaHw::RnicGateSlotEntry hwSlot;
+          hwSlot.startOffsetNs = slots[k].startOffsetNs;
+          hwSlot.endOffsetNs = slots[k].endOffsetNs;
+          hwSlot.dstRnicBitmapWords = slots[k].bitmapWords;
+          hwSlots.push_back (hwSlot);
+        }
+
+      transport->EnableInjectionGate(
+        rnic,
+        0,
+        periodNs,
+        hwSlots);
+    }
+}
 
 } // namespace ns3

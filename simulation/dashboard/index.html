@@ -63,15 +63,34 @@
         <div id="flowResultTable" class="table-wrap wide-table"></div>
       </section>
 
-      <section class="grid stats-windows-grid">
-        <div class="card">
-          <div class="card-header"><h3>OCS Stats</h3></div>
-          <div id="ocsStatsTable" class="table-wrap"></div>
+      <section class="grid control-plane-grid" aria-label="Injection control and OCS statistics">
+        <div class="control-plane-left">
+          <div class="card compact-card">
+            <div class="card-header compact-header"><h3>OCS Stats</h3></div>
+            <div id="ocsStatsTable" class="table-wrap compact-table"></div>
+          </div>
+          <div class="card compact-card">
+            <div class="card-header compact-header"><h3>Injection Control Summary</h3></div>
+            <div id="injectionSummary"></div>
+          </div>
         </div>
-        <div class="card">
-          <div class="card-header"><h3>RDMA Injection Window Table</h3></div>
-          <div id="injectionTable" class="table-wrap"></div>
+        <div class="card injection-window-card">
+          <div class="card-header">
+            <h3>Injection Window Table</h3>
+          </div>
+          <div id="injectionTable" class="table-wrap wide-table"></div>
         </div>
+      </section>
+
+      <section id="userspacePostSection" class="card userspace-post-card">
+        <div class="card-header row-between">
+          <div>
+            <h3>Userspace WR Post Events</h3>
+            <p id="userspacePostMeta" class="muted">Summary plus sampled work-request post events.</p>
+          </div>
+        </div>
+        <div id="userspacePostSummaryTable" class="table-wrap compact-userspace-summary"></div>
+        <div id="userspacePostTable" class="table-wrap wide-table"></div>
       </section>
 
       <section class="card">

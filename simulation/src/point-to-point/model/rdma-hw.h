@@ -56,9 +56,19 @@ public:
 	uint64_t m_rnicGatePeriodNs;
 	std::vector<RnicGateSlotEntry> m_rnicGateSlots;
 
-	// qp complete callback
+	// QP completion callback: the complete flow has finished.
 	typedef Callback<void, Ptr<RdmaQueuePair> > QpCompleteCallback;
+
+	// QP progress callback: snd_una has advanced after an ACK.
+	typedef Callback<void, Ptr<RdmaQueuePair> > QpProgressCallback;
+	typedef Callback<void, Ptr<RdmaQueuePair> > QpRecoverCallback;
+
 	QpCompleteCallback m_qpCompleteCallback;
+	QpProgressCallback m_qpProgressCallback;
+	QpRecoverCallback m_qpRecoverCallback;
+
+	void SetQpProgressCallback(QpProgressCallback cb);
+	void SetQpRecoverCallback(QpRecoverCallback cb);
 
 	void SetNode(Ptr<Node> node);
 	void Setup(QpCompleteCallback cb); // setup shared data and callbacks with the QbbNetDevice
@@ -74,6 +84,21 @@ public:
 	static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t pg); // get the lookup key for m_qpMap
 	Ptr<RdmaQueuePair> GetQp(uint32_t dip, uint16_t sport, uint16_t pg); // get the qp
 	uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp); // get the NIC index of the qp
+	
+	Ptr<RdmaQueuePair> CreateQueuePair(
+		uint64_t size,
+		uint16_t pg,
+		Ipv4Address sip,
+		Ipv4Address dip,
+		uint16_t sport,
+		uint16_t dport,
+		uint32_t win,
+		uint64_t baseRtt,
+		Callback<void> notifyAppFinish,
+		uint64_t initialPostedBytes);
+
+	void PostWork(Ptr<RdmaQueuePair> qp, uint64_t bytes);
+
 	void AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish); // add a new qp (new send)
 	void DeleteQueuePair(Ptr<RdmaQueuePair> qp);
 

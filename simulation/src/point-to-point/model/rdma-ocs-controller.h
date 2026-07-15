@@ -53,6 +53,7 @@ public:
   void DumpRnicGroups () const;
   void DumpRnicReachabilityWindows () const;
   void InstallRnicGateTablesToRdmaHw () const;
+  void InstallRnicGateTablesToUserspace () const;
 
   uint32_t GetRnicGroupForNode (uint32_t nodeId) const;
 

@@ -18,8 +18,13 @@ public:
 	Ipv4Address sip, dip;
 	uint16_t sport, dport;
 	uint64_t m_size;
-	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
+
+	// Highest byte offset admitted by host userspace to the RNIC.
+	// Valid RNIC-visible range: [0, m_postedLimit).
+	uint64_t m_postedLimit;
 	
+	uint64_t snd_nxt, snd_una; // next seq to send, the highest unacked seq
+
 	// Retransmission statistics
 	uint64_t m_maxSeqSent = 0;      // highest byte sequence ever generated
 	uint64_t m_retxPackets = 0;     // number of retransmitted DATA packets
@@ -93,6 +98,13 @@ public:
 	static TypeId GetTypeId (void);
 	RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport);
 	void SetSize(uint64_t size);
+	
+	void SetPostedLimit(uint64_t limit);
+	void AddPostedBytes(uint64_t bytes);
+	uint64_t GetPostedLimit() const;
+	uint64_t GetUnpostedBytes() const;
+	uint64_t GetPostedOutstandingBytes() const;
+
 	void SetWin(uint32_t win);
 	void SetBaseRtt(uint64_t baseRtt);
 	void SetVarWin(bool v);
