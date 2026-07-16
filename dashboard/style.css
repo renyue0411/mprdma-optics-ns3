@@ -216,7 +216,7 @@ input[type="search"] {
 
 .slice-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr));
   gap: 12px;
   align-items: stretch;
 }
@@ -238,13 +238,98 @@ input[type="search"] {
   margin-bottom: 8px;
 }
 
-.topology-svg {
-  width: 98%;
-  max-width: 420px;
-  height: auto;
+.topology-viewport {
+  width: 100%;
   min-height: 210px;
+  max-height: 520px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  border-radius: 10px;
+}
+
+.topology-viewport:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.topology-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  margin: 3px 0 7px;
+}
+
+.topology-toolbar button {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  color: var(--blue-dark);
+  border-radius: 7px;
+  min-height: 27px;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.topology-toolbar button:hover {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.topology-toolbar button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 1px;
+}
+
+.topology-tool-button {
+  min-width: 29px;
+  font-size: 16px !important;
+  line-height: 1;
+}
+
+.topology-zoom-label {
+  min-width: 54px;
+}
+
+.topology-reset-layout {
+  margin-left: 3px;
+}
+
+.topology-svg {
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  height: auto;
+  min-height: 0;
   display: block;
   margin: 0 auto;
+  user-select: none;
+}
+
+
+.topology-edge,
+.port-annotation {
+  pointer-events: none;
+}
+
+.topology-draggable {
+  cursor: grab;
+  touch-action: none;
+}
+
+.topology-draggable.is-dragging {
+  cursor: grabbing;
+}
+
+.topology-draggable:hover .node-rnic,
+.topology-draggable:hover .node-eps,
+.topology-draggable:hover .node-ocs,
+.topology-draggable:hover .logical-node-card,
+.topology-draggable:hover .logical-nic-card {
+  filter: drop-shadow(0 3px 6px rgba(47, 101, 141, 0.22));
 }
 
 .node-label {
@@ -256,33 +341,33 @@ input[type="search"] {
 }
 
 .node-label-host {
-  font-size: 11px;
+  font-size: 9px;
 }
 
 .node-label-eps {
-  font-size: 11px;
+  font-size: 9px;
 }
 
 .node-label-ocs {
-  font-size: 11px;
+  font-size: 9px;
 }
 
 .node-rnic {
   fill: #eef7fc;
   stroke: #4d8eb8;
-  stroke-width: 2.1;
+  stroke-width: 1.6;
 }
 
 .node-eps {
   fill: #fff4df;
   stroke: #b8873b;
-  stroke-width: 2.1;
+  stroke-width: 1.6;
 }
 
 .node-ocs {
   fill: #e4edfb;
   stroke: #4c72a4;
-  stroke-width: 2.1;
+  stroke-width: 1.6;
 }
 
 .link-physical {
@@ -297,7 +382,7 @@ input[type="search"] {
 }
 
 .port-annotation {
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 850;
   text-anchor: middle;
 }
@@ -353,6 +438,30 @@ input[type="search"] {
   border-radius: 50%;
   background: #eef7fc;
   border: 1.5px solid #4d8eb8;
+}
+
+.legend-plane {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #ffffff;
+  border: 1.5px solid #2f658d;
+}
+
+.legend-nic {
+  width: 14px;
+  height: 9px;
+  border-radius: 3px;
+  background: #edf5fa;
+  border: 1.5px solid #5f91b3;
+}
+
+.legend-node {
+  width: 14px;
+  height: 9px;
+  border-radius: 3px;
+  background: #f7fbfe;
+  border: 1.5px solid #7fb0d1;
 }
 
 .legend-eps {
@@ -529,10 +638,6 @@ th {
    ========================= */
 
 @media (max-width: 1300px) {
-  .slice-grid {
-    grid-template-columns: repeat(2, minmax(340px, 1fr));
-  }
-
   .flow-fct-grid {
     grid-template-columns: 1fr;
   }
@@ -805,38 +910,54 @@ th {
 .logical-node-card {
   fill: #f7fbfe;
   stroke: #7fb0d1;
-  stroke-width: 1.8;
-  filter: drop-shadow(0 4px 9px rgba(42, 85, 114, 0.10));
+  stroke-width: 1.2;
+  filter: drop-shadow(0 2px 5px rgba(42, 85, 114, 0.10));
 }
 
 .logical-node-title {
   fill: #1e2b37;
-  font-size: 11px;
+  font-size: 8px;
   font-weight: 850;
   text-anchor: middle;
   dominant-baseline: middle;
   pointer-events: none;
 }
 
-.endpoint-port-dot {
-  fill: #ffffff;
-  stroke: #2f658d;
-  stroke-width: 2;
+.logical-nic-card {
+  fill: #edf5fa;
+  stroke: #5f91b3;
+  stroke-width: 1.15;
 }
 
-.endpoint-port-label {
-  fill: #2f658d;
-  font-size: 10px;
-  font-weight: 900;
+.logical-nic-title {
+  fill: #446b86;
+  font-size: 7px;
+  font-weight: 800;
   text-anchor: middle;
   dominant-baseline: middle;
   pointer-events: none;
 }
 
-.endpoint-token-label {
-  fill: #647789;
-  font-size: 8px;
-  font-weight: 700;
+.logical-nic-link {
+  stroke: #91aaba;
+  stroke-width: 1.1;
+  pointer-events: none;
+}
+
+.logical-endpoint-port {
+  pointer-events: none;
+}
+
+.endpoint-port-dot {
+  fill: #ffffff;
+  stroke: #2f658d;
+  stroke-width: 1.4;
+}
+
+.endpoint-port-label {
+  fill: #2f658d;
+  font-size: 7px;
+  font-weight: 900;
   text-anchor: middle;
   dominant-baseline: middle;
   pointer-events: none;

@@ -262,178 +262,452 @@ function typeOrderForFabric(t) {
   return 2;
 }
 
-function layoutLogicalEndpointTopology(topology) {
-  const nodes = topology.nodes || [];
-  const links = topology.links || [];
-  const logicalNodes = (topology.logicalNodes || [])
-    .slice()
-    .sort((a, b) => Number(a.logicalId) - Number(b.logicalId));
+function addUndirectedLayoutEdge(adj, a, b) {
+  if (a === b) return;
+  if (!adj.has(a)) adj.set(a, new Set());
+  if (!adj.has(b)) adj.set(b, new Set());
+  adj.get(a).add(b);
+  adj.get(b).add(a);
+}
 
-  const nodeById = new Map(nodes.map(n => [n.id, n]));
-  const pos = new Map();
-  const typeOf = id => nodeById.get(id)?.type || 'rnic';
+function shortestLayoutDistances(adj, starts, allowed) {
+  const distance = new Map();
+  const queue = [];
 
-  const ocsNodes = nodes.filter(n => n.type === 'ocs').slice().sort((a, b) => a.id - b.id);
-  const epsNodes = nodes.filter(n => n.type === 'eps').slice().sort((a, b) => a.id - b.id);
-  const ocsSet = new Set(ocsNodes.map(n => n.id));
-  const ocsOcsLinks = links.filter(l => typeOf(l.src) === 'ocs' && typeOf(l.dst) === 'ocs');
-  const ocsAdj = new Map();
-
-  ocsNodes.forEach(n => ocsAdj.set(n.id, []));
-  ocsOcsLinks.forEach(l => {
-    ocsAdj.get(l.src)?.push(l.dst);
-    ocsAdj.get(l.dst)?.push(l.src);
+  starts.forEach(key => {
+    if (!allowed.has(key) || distance.has(key)) return;
+    distance.set(key, 0);
+    queue.push(key);
   });
-  ocsAdj.forEach(list => list.sort((a, b) => a - b));
 
-  function nonOcsDegree(id) {
-    return links.filter(l => {
-      if (l.src === id) return !ocsSet.has(l.dst);
-      if (l.dst === id) return !ocsSet.has(l.src);
-      return false;
-    }).length;
+  while (queue.length) {
+    const current = queue.shift();
+    const nextDistance = distance.get(current) + 1;
+
+    Array.from(adj.get(current) || [])
+      .filter(key => allowed.has(key))
+      .sort()
+      .forEach(key => {
+        if (distance.has(key)) return;
+        distance.set(key, nextDistance);
+        queue.push(key);
+      });
   }
 
-  const logicalBoxW = Math.max(140, Math.min(220, 92 + Math.max(0, ...logicalNodes.map(n => (n.endpoints || []).length)) * 46));
-  const logicalGap = 72;
-  const leftPad = 56;
-  const canvasWidth = Math.max(
-    560,
-    leftPad * 2 + logicalNodes.length * logicalBoxW + Math.max(0, logicalNodes.length - 1) * logicalGap,
-    leftPad * 2 + Math.max(1, ocsNodes.length) * 120
-  );
+  return distance;
+}
 
-  let maxOcsLevel = 0;
+function connectedLayoutComponents(vertexKeys, adj) {
+  const remaining = new Set(vertexKeys);
+  const components = [];
 
-  if (ocsNodes.length) {
-    let roots = ocsNodes
-      .filter(o => nonOcsDegree(o.id) === 0 && (ocsAdj.get(o.id) || []).length > 0)
-      .map(o => o.id)
-      .sort((a, b) => a - b);
+  while (remaining.size) {
+    const start = Array.from(remaining).sort()[0];
+    const component = new Set([start]);
+    const queue = [start];
+    remaining.delete(start);
 
-    if (!roots.length) {
-      const best = ocsNodes
-        .slice()
-        .sort((a, b) => ((ocsAdj.get(b.id) || []).length - (ocsAdj.get(a.id) || []).length) || a.id - b.id)[0];
-      roots = best ? [best.id] : [];
+    while (queue.length) {
+      const current = queue.shift();
+
+      Array.from(adj.get(current) || [])
+        .sort()
+        .forEach(next => {
+          if (!remaining.has(next)) return;
+          remaining.delete(next);
+          component.add(next);
+          queue.push(next);
+        });
     }
 
+    components.push(component);
+  }
+
+  return components.sort((a, b) => {
+    return Array.from(a).sort()[0].localeCompare(Array.from(b).sort()[0]);
+  });
+}
+
+function chooseConnectivityRoots(component, vertices, adj, explicitTerminals) {
+  const candidates = Array.from(component).filter(key => vertices.get(key)?.kind !== 'logical');
+  const usableCandidates = candidates.length ? candidates : Array.from(component);
+  const terminals = explicitTerminals.filter(key => component.has(key));
+
+  if (terminals.length) {
+    // Multi-source distance from all endpoint/logical-node leaves. Vertices
+    // furthest from their nearest endpoint form the physical fabric core.
+    const distanceFromEndpoints = shortestLayoutDistances(adj, terminals, component);
+    const maxDistance = Math.max(
+      0,
+      ...usableCandidates.map(key => distanceFromEndpoints.get(key) ?? 0)
+    );
+
+    const roots = usableCandidates
+      .filter(key => (distanceFromEndpoints.get(key) ?? 0) === maxDistance)
+      .sort((a, b) => {
+        const degreeDiff = (adj.get(b)?.size || 0) - (adj.get(a)?.size || 0);
+        return degreeDiff || a.localeCompare(b);
+      });
+
+    // Keep all adjacent/equivalent core vertices at level 0. This avoids
+    // inventing an arbitrary hierarchy inside a symmetric fabric core.
+    return roots;
+  }
+
+  // No explicit endpoint is available. Select the graph centre using minimum
+  // eccentricity, with degree as the deterministic tie-breaker.
+  let bestEccentricity = Infinity;
+  let roots = [];
+
+  usableCandidates.forEach(candidate => {
+    const distances = shortestLayoutDistances(adj, [candidate], component);
+    const eccentricity = Math.max(0, ...Array.from(component).map(key => distances.get(key) ?? 0));
+
+    if (eccentricity < bestEccentricity) {
+      bestEccentricity = eccentricity;
+      roots = [candidate];
+      return;
+    }
+
+    if (eccentricity === bestEccentricity) {
+      roots.push(candidate);
+    }
+  });
+
+  const maxDegree = Math.max(0, ...roots.map(key => adj.get(key)?.size || 0));
+  return roots
+    .filter(key => (adj.get(key)?.size || 0) === maxDegree)
+    .sort();
+}
+
+function layoutConnectivityGraph(vertices, adj, terminalKeys) {
+  const components = connectedLayoutComponents(Array.from(vertices.keys()), adj);
+  const placements = new Map();
+  const componentGap = 110;
+  const horizontalGap = 42;
+  const minimumSlotWidth = 96;
+  const levelGap = 112;
+  const topPad = 58;
+  const leftPad = 54;
+  let globalCursor = leftPad;
+  let maximumLevel = 0;
+
+  function layoutOrderValue(key) {
+    const vertex = vertices.get(key);
+
+    if (vertex?.kind === 'logical') {
+      const logicalId = Number(vertex.item?.logicalId);
+      return Number.isFinite(logicalId) ? logicalId : Number.MAX_SAFE_INTEGER;
+    }
+
+    const nodeId = Number(vertex?.node?.id);
+    return Number.isFinite(nodeId) ? nodeId : Number.MAX_SAFE_INTEGER;
+  }
+
+  function compareLayoutKeys(a, b) {
+    const numericDiff = layoutOrderValue(a) - layoutOrderValue(b);
+    if (numericDiff !== 0) return numericDiff;
+    return a.localeCompare(b, undefined, {numeric: true});
+  }
+
+  components.forEach(component => {
+    const roots = Array.from(new Set(
+      chooseConnectivityRoots(component, vertices, adj, terminalKeys)
+    ));
     const level = new Map();
     const queue = [];
 
-    roots.forEach(r => {
-      level.set(r, 0);
-      queue.push(r);
+    roots.forEach(root => {
+      level.set(root, 0);
+      queue.push(root);
     });
 
     while (queue.length) {
-      const u = queue.shift();
-      (ocsAdj.get(u) || []).forEach(v => {
-        if (!level.has(v)) {
-          level.set(v, level.get(u) + 1);
-          queue.push(v);
-        }
+      const current = queue.shift();
+      const neighbors = Array.from(adj.get(current) || [])
+        .filter(key => component.has(key))
+        .sort((a, b) => {
+          const degreeDiff = (adj.get(b)?.size || 0) - (adj.get(a)?.size || 0);
+          return degreeDiff || a.localeCompare(b);
+        });
+
+      neighbors.forEach(next => {
+        if (level.has(next)) return;
+        level.set(next, level.get(current) + 1);
+        queue.push(next);
       });
     }
 
-    ocsNodes.forEach(o => {
-      if (!level.has(o.id)) {
-        level.set(o.id, 0);
+    // Keep every malformed/disconnected vertex visible without introducing a
+    // device-type-based hierarchy.
+    Array.from(component).sort().forEach(key => {
+      if (!level.has(key)) {
+        level.set(key, 0);
+        roots.push(key);
       }
     });
 
-    maxOcsLevel = Math.max(0, ...Array.from(level.values()));
+    const componentMaxLevel = Math.max(
+      0,
+      ...Array.from(component).map(key => level.get(key) || 0)
+    );
+    maximumLevel = Math.max(maximumLevel, componentMaxLevel);
 
-    const byLevel = new Map();
-    ocsNodes.forEach(o => {
-      const lv = level.get(o.id) || 0;
-      if (!byLevel.has(lv)) byLevel.set(lv, []);
-      byLevel.get(lv).push(o.id);
+    const layers = Array.from({length: componentMaxLevel + 1}, () => []);
+    Array.from(component).sort().forEach(key => {
+      layers[level.get(key) || 0].push(key);
     });
 
-    byLevel.forEach((ids, lv) => {
-      ids.sort((a, b) => a - b);
-      const gap = Math.min(170, Math.max(110, canvasWidth / Math.max(2, ids.length + 1)));
-      const start = canvasWidth / 2 - ((ids.length - 1) * gap) / 2;
+    // Keep the connectivity-derived level, but order every level strictly by
+    // its displayed numeric identifier from left to right. Device type does
+    // not affect the order: O5 precedes O6, E1 precedes E2, and logical
+    // Node 19 precedes Node 23 when they share the same level.
+    layers.forEach(layerKeys => {
+      layerKeys.sort(compareLayoutKeys);
+    });
 
-      ids.forEach((id, idx) => {
-        pos.set(id, {
-          x: start + idx * gap,
-          y: 48 + lv * 86,
-          type: 'ocs'
+    // Calculate spacing independently for every level. A logical Node → NIC
+    // → Plane group is wider than an OCS/EPS icon; using one component-wide
+    // slot width made the endpoint layer unnecessarily sparse.
+    const layerMetrics = layers.map(layerKeys => {
+      const layerVertexWidth = Math.max(
+        64,
+        ...layerKeys.map(key => vertices.get(key)?.width || 64)
+      );
+      const logicalOnly = layerKeys.length > 0 && layerKeys.every(key => {
+        return vertices.get(key)?.kind === 'logical';
+      });
+      const layerHorizontalGap = logicalOnly ? 16 : horizontalGap;
+      const layerMinimumSlotWidth = logicalOnly ? 72 : minimumSlotWidth;
+      const slotWidth = Math.max(
+        layerMinimumSlotWidth,
+        layerVertexWidth + layerHorizontalGap
+      );
+      const layerWidth = layerVertexWidth + Math.max(0, layerKeys.length - 1) * slotWidth;
+
+      return {
+        layerVertexWidth,
+        slotWidth,
+        layerWidth
+      };
+    });
+
+    const componentWidth = Math.max(
+      64,
+      ...layerMetrics.map(metric => metric.layerWidth)
+    );
+    const componentCenter = globalCursor + componentWidth / 2;
+
+    layers.forEach((layerKeys, currentLevel) => {
+      if (!layerKeys.length) return;
+
+      const slotWidth = layerMetrics[currentLevel].slotWidth;
+      const layerSpan = (layerKeys.length - 1) * slotWidth;
+      const layerStart = componentCenter - layerSpan / 2;
+
+      layerKeys.forEach((key, index) => {
+        placements.set(key, {
+          x: layerStart + index * slotWidth,
+          y: topPad + currentLevel * levelGap,
+          level: currentLevel
         });
       });
     });
-  }
 
-  if (epsNodes.length) {
-    const y = 58 + (maxOcsLevel + 1) * 86;
-    const gap = Math.min(160, Math.max(110, canvasWidth / Math.max(2, epsNodes.length + 1)));
-    const start = canvasWidth / 2 - ((epsNodes.length - 1) * gap) / 2;
-
-    epsNodes.forEach((e, idx) => {
-      pos.set(e.id, {
-        x: start + idx * gap,
-        y,
-        type: 'eps'
-      });
-    });
-  }
-
-  const logicalY = 58 + (maxOcsLevel + 1) * 86 + (epsNodes.length ? 86 : 74);
-  const totalLogicalWidth = logicalNodes.length * logicalBoxW + Math.max(0, logicalNodes.length - 1) * logicalGap;
-  let cursor = canvasWidth / 2 - totalLogicalWidth / 2;
-  const logicalBoxes = [];
-
-  logicalNodes.forEach(ln => {
-    const endpoints = (ln.endpoints || []).slice().sort((a, b) => {
-      return Number(a.rnicGroupId) - Number(b.rnicGroupId) ||
-        Number(a.planeId) - Number(b.planeId) ||
-        Number(a.carrierNodeId) - Number(b.carrierNodeId);
-    });
-
-    const x = cursor + logicalBoxW / 2;
-    const box = {
-      logicalId: ln.logicalId,
-      label: ln.label || `Node ${ln.logicalId}`,
-      x,
-      y: logicalY,
-      width: logicalBoxW,
-      height: 76,
-      endpoints
-    };
-
-    const epGap = endpoints.length > 1 ? Math.min(54, (logicalBoxW - 44) / (endpoints.length - 1)) : 0;
-    const epStart = x - ((endpoints.length - 1) * epGap) / 2;
-
-    endpoints.forEach((ep, idx) => {
-      const ex = epStart + idx * epGap;
-      const ey = logicalY - 20;
-      ep._x = ex;
-      ep._y = ey;
-      pos.set(Number(ep.carrierNodeId), {
-        x: ex,
-        y: ey,
-        type: 'rnic',
-        endpointToken: ep.token,
-        logicalId: ep.logicalId,
-        planeId: ep.planeId,
-        rnicGroupId: ep.rnicGroupId,
-      });
-    });
-
-    logicalBoxes.push(box);
-    cursor += logicalBoxW + logicalGap;
+    globalCursor += componentWidth + componentGap;
   });
 
-  const height = logicalY + 58;
+  return {
+    placements,
+    width: Math.max(460, globalCursor - componentGap + leftPad),
+    height: topPad + maximumLevel * levelGap + 70
+  };
+}
+
+function buildLogicalLayouts(topology) {
+  const planeGap = 22;
+  const nicGap = 8;
+  const nicCardHeight = 24;
+  const nodeCardHeight = 20;
+
+  return (topology.logicalNodes || [])
+    .slice()
+    .sort((a, b) => Number(a.logicalId) - Number(b.logicalId))
+    .map(ln => {
+      const endpoints = (ln.endpoints || []).slice().sort((a, b) => {
+        return Number(a.rnicGroupId) - Number(b.rnicGroupId) ||
+          Number(a.planeId) - Number(b.planeId) ||
+          Number(a.carrierNodeId) - Number(b.carrierNodeId);
+      });
+      const nicMap = new Map();
+
+      endpoints.forEach(ep => {
+        const nicId = Number(ep.rnicGroupId);
+        if (!nicMap.has(nicId)) nicMap.set(nicId, []);
+        nicMap.get(nicId).push(ep);
+      });
+
+      const nics = Array.from(nicMap.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([nicId, nicEndpoints]) => {
+          const sortedEndpoints = nicEndpoints.slice().sort((a, b) => {
+            return Number(a.planeId) - Number(b.planeId) ||
+              Number(a.carrierNodeId) - Number(b.carrierNodeId);
+          });
+
+          return {
+            nicId,
+            endpoints: sortedEndpoints,
+            width: Math.max(42, 18 + sortedEndpoints.length * planeGap)
+          };
+        });
+
+      const totalNicWidth = nics.reduce((sum, nic) => sum + nic.width, 0) +
+        Math.max(0, nics.length - 1) * nicGap;
+
+      return {
+        logicalId: ln.logicalId,
+        label: ln.label || `Node ${ln.logicalId}`,
+        endpoints,
+        nics,
+        width: Math.max(62, totalNicWidth + 12),
+        nodeCardHeight,
+        nicCardHeight,
+        nicGap,
+        planeGap
+      };
+    });
+}
+
+function layoutLogicalEndpointTopology(topology) {
+  const nodes = topology.nodes || [];
+  const links = topology.links || [];
+  const nodeById = new Map(nodes.map(node => [Number(node.id), node]));
+  const logicalLayouts = buildLogicalLayouts(topology);
+  const logicalById = new Map(logicalLayouts.map(item => [String(item.logicalId), item]));
+  const carrierToLogical = new Map();
+  const vertices = new Map();
+  const adj = new Map();
+  const pos = new Map();
+
+  logicalLayouts.forEach(item => {
+    const key = `logical:${item.logicalId}`;
+    vertices.set(key, {
+      key,
+      kind: 'logical',
+      width: item.width,
+      item
+    });
+    adj.set(key, new Set());
+
+    item.endpoints.forEach(ep => {
+      carrierToLogical.set(Number(ep.carrierNodeId), key);
+    });
+  });
+
+  nodes
+    .filter(node => node.type !== 'rnic' || !carrierToLogical.has(Number(node.id)))
+    .forEach(node => {
+      const key = `node:${node.id}`;
+      vertices.set(key, {
+        key,
+        kind: 'fabric',
+        width: node.type === 'eps' ? 72 : 68,
+        node
+      });
+      adj.set(key, new Set());
+    });
+
+  const displayKeyForNode = nodeId => {
+    const numericId = Number(nodeId);
+    if (carrierToLogical.has(numericId)) return carrierToLogical.get(numericId);
+    return `node:${numericId}`;
+  };
+
+  links.forEach(link => {
+    const a = displayKeyForNode(link.src);
+    const b = displayKeyForNode(link.dst);
+    if (!vertices.has(a) || !vertices.has(b)) return;
+    addUndirectedLayoutEdge(adj, a, b);
+  });
+
+  const terminalKeys = logicalLayouts.map(item => `logical:${item.logicalId}`);
+  const graphLayout = layoutConnectivityGraph(vertices, adj, terminalKeys);
+  const logicalBoxes = [];
+
+  vertices.forEach((vertex, key) => {
+    const placement = graphLayout.placements.get(key);
+    if (!placement) return;
+
+    if (vertex.kind === 'fabric') {
+      pos.set(Number(vertex.node.id), {
+        x: placement.x,
+        y: placement.y,
+        type: vertex.node.type || 'rnic'
+      });
+      return;
+    }
+
+    const item = logicalById.get(String(vertex.item.logicalId));
+    const x = placement.x;
+    const logicalY = placement.y;
+    const nicY = logicalY - item.nodeCardHeight / 2 - 3 - item.nicCardHeight / 2;
+    const totalNicWidth = item.nics.reduce((sum, nic) => sum + nic.width, 0) +
+      Math.max(0, item.nics.length - 1) * item.nicGap;
+    let nicCursor = x - totalNicWidth / 2;
+
+    const nics = item.nics.map(nic => {
+      const nicX = nicCursor + nic.width / 2;
+      const endpoints = nic.endpoints;
+      const epGap = endpoints.length > 1
+        ? Math.min(item.planeGap, (nic.width - 18) / (endpoints.length - 1))
+        : 0;
+      const epStart = nicX - ((endpoints.length - 1) * epGap) / 2;
+
+      endpoints.forEach((ep, index) => {
+        const ex = epStart + index * epGap;
+        const ey = nicY - item.nicCardHeight / 2;
+        ep._x = ex;
+        ep._y = ey;
+        pos.set(Number(ep.carrierNodeId), {
+          x: ex,
+          y: ey,
+          type: 'rnic',
+          endpointToken: ep.token,
+          logicalId: ep.logicalId,
+          planeId: ep.planeId,
+          rnicGroupId: ep.rnicGroupId
+        });
+      });
+
+      nicCursor += nic.width + item.nicGap;
+      return {
+        ...nic,
+        x: nicX,
+        y: nicY,
+        height: item.nicCardHeight
+      };
+    });
+
+    logicalBoxes.push({
+      logicalId: item.logicalId,
+      label: item.label,
+      x,
+      y: logicalY,
+      width: item.width,
+      nodeCardWidth: Math.max(48, Math.min(68, 38 + String(item.label).length * 3)),
+      nodeCardHeight: item.nodeCardHeight,
+      endpoints: item.endpoints,
+      nics
+    });
+  });
 
   return {
     pos,
-    width: canvasWidth,
-    height,
+    width: graphLayout.width,
+    height: graphLayout.height,
     logicalBoxes,
-    logicalEndpointView: true,
+    logicalEndpointView: true
   };
 }
 
@@ -444,676 +718,50 @@ function layoutHierarchy(topology) {
 
   const nodes = topology.nodes || [];
   const links = topology.links || [];
-  const nodeById = new Map(nodes.map(n => [n.id, n]));
-  const adj = buildAdjacency(topology);
+  const vertices = new Map();
+  const adj = new Map();
   const pos = new Map();
 
-  const typeOf = id => nodeById.get(id)?.type || 'rnic';
-
-  const ocsNodes = nodes
-    .filter(n => n.type === 'ocs')
-    .slice()
-    .sort((a, b) => a.id - b.id);
-
-  const epsNodes = nodes
-    .filter(n => n.type === 'eps')
-    .slice()
-    .sort((a, b) => a.id - b.id);
-
-  const hostNodes = nodes
-    .filter(n => n.type !== 'ocs' && n.type !== 'eps')
-    .slice()
-    .sort((a, b) => a.id - b.id);
-
-  function neighborsOfType(id, type) {
-    return (adj.get(id) || []).filter(v => typeOf(v) === type).sort((a, b) => a - b);
-  }
-
-  function nonOcsDegree(id) {
-    return (adj.get(id) || []).filter(v => typeOf(v) !== 'ocs').length;
-  }
-
-  function ocsDegree(id) {
-    return (adj.get(id) || []).filter(v => typeOf(v) === 'ocs').length;
-  }
-
-  function hostParent(hostId) {
-    const eps = neighborsOfType(hostId, 'eps');
-    if (eps.length) return eps[0];
-
-    const ocs = neighborsOfType(hostId, 'ocs');
-    if (ocs.length) return ocs[0];
-
-    const all = (adj.get(hostId) || []).slice().sort((a, b) => a - b);
-    return all.length ? all[0] : null;
-  }
-
-  function epsParentOcs(epsId) {
-    const ocs = neighborsOfType(epsId, 'ocs');
-    if (ocs.length) return ocs[0];
-    return null;
-  }
-
-  function minConnectedOcsPort(nodeId) {
-    const ports = [];
-
-    links.forEach(l => {
-      if (l.src === nodeId && typeOf(l.dst) === 'ocs' && l.dst_port !== null && l.dst_port !== undefined) {
-        ports.push(Number(l.dst_port));
-      }
-
-      if (l.dst === nodeId && typeOf(l.src) === 'ocs' && l.src_port !== null && l.src_port !== undefined) {
-        ports.push(Number(l.src_port));
-      }
+  nodes.forEach(node => {
+    const key = `node:${node.id}`;
+    vertices.set(key, {
+      key,
+      kind: 'fabric',
+      width: node.type === 'eps' ? 72 : 68,
+      node
     });
+    adj.set(key, new Set());
+  });
 
-    if (!ports.length) return nodeId;
-    return Math.min(...ports);
-  }
+  links.forEach(link => {
+    const a = `node:${link.src}`;
+    const b = `node:${link.dst}`;
+    if (!vertices.has(a) || !vertices.has(b)) return;
+    addUndirectedLayoutEdge(adj, a, b);
+  });
 
-  const ocsOcsLinks = links.filter(l => typeOf(l.src) === 'ocs' && typeOf(l.dst) === 'ocs');
+  // In a topology without logical-node metadata, graph leaves are treated as
+  // endpoints. Device type does not determine the hierarchy.
+  const terminalKeys = Array.from(vertices.keys()).filter(key => (adj.get(key)?.size || 0) <= 1);
+  const graphLayout = layoutConnectivityGraph(vertices, adj, terminalKeys);
 
-  /*
-   * Case 1: EPS + parallel OCS fabric.
-   *
-   * Example:
-   *   O4 and O5 both connect to EPS0..EPS3.
-   *   There is no OCS-OCS link.
-   *
-   * Layout:
-   *   OCS layer
-   *   EPS layer
-   *   Host layer
-   */
-  if (ocsNodes.length && epsNodes.length && ocsOcsLinks.length === 0) {
-    const hostGap = 48;
-    const minBlockWidth = 168;
-    const blockGap = 34;
-    const leftPad = 42;
-
-    const ocsY = 44;
-    const epsY = 132;
-    const hostY = 220;
-
-    const epsOrdered = epsNodes
-      .slice()
-      .sort((a, b) => {
-        const pa = minConnectedOcsPort(a.id);
-        const pb = minConnectedOcsPort(b.id);
-        return pa - pb || a.id - b.id;
-      });
-
-    const hostsByEps = new Map();
-    epsOrdered.forEach(e => hostsByEps.set(e.id, []));
-
-    hostNodes.forEach(h => {
-      const p = hostParent(h.id);
-      if (hostsByEps.has(p)) {
-        hostsByEps.get(p).push(h.id);
-      }
+  vertices.forEach((vertex, key) => {
+    const placement = graphLayout.placements.get(key);
+    if (!placement) return;
+    pos.set(Number(vertex.node.id), {
+      x: placement.x,
+      y: placement.y,
+      type: vertex.node.type || 'rnic'
     });
-
-    hostsByEps.forEach(list => list.sort((a, b) => a - b));
-
-    const blocks = epsOrdered.map(e => {
-      const children = hostsByEps.get(e.id) || [];
-      return {
-        epsId: e.id,
-        children,
-        width: Math.max(minBlockWidth, Math.max(1, children.length) * hostGap + 28)
-      };
-    });
-
-    const canvasWidth = Math.max(
-      520,
-      leftPad * 2 +
-      blocks.reduce((sum, b) => sum + b.width, 0) +
-      Math.max(0, blocks.length - 1) * blockGap
-    );
-
-    let cursor = leftPad;
-    const epsX = new Map();
-
-    blocks.forEach(block => {
-      const centerX = cursor + block.width / 2;
-      epsX.set(block.epsId, centerX);
-
-      pos.set(block.epsId, {
-        x: centerX,
-        y: epsY,
-        type: 'eps'
-      });
-
-      const startX = centerX - ((block.children.length - 1) * hostGap) / 2;
-
-      block.children.forEach((hid, idx) => {
-        pos.set(hid, {
-          x: startX + idx * hostGap,
-          y: hostY,
-          type: 'rnic'
-        });
-      });
-
-      cursor += block.width + blockGap;
-    });
-
-    const fabricLeft = Math.min(...Array.from(epsX.values()));
-    const fabricRight = Math.max(...Array.from(epsX.values()));
-    const fabricCenter = (fabricLeft + fabricRight) / 2;
-
-    const ocsGap = Math.max(90, Math.min(150, canvasWidth / Math.max(2, ocsNodes.length + 1)));
-    const ocsStart = fabricCenter - ((ocsNodes.length - 1) * ocsGap) / 2;
-
-    ocsNodes.forEach((o, idx) => {
-      pos.set(o.id, {
-        x: ocsStart + idx * ocsGap,
-        y: ocsY,
-        type: 'ocs'
-      });
-    });
-
-    return {
-      pos,
-      width: canvasWidth,
-      height: 270
-    };
-  }
-
-  /*
-   * Case 2: OCS fabric has OCS-OCS links.
-   *
-   * Example:
-   *   O5 connects to O3 and O4.
-   *   O3 connects to direct RNICs.
-   *   O4 connects to EPSs.
-   *
-   * Layout:
-   *   core OCS layer
-   *   access OCS layer
-   *   EPS/direct-host layer
-   *   host-under-EPS layer
-   */
-  if (ocsNodes.length && ocsOcsLinks.length > 0) {
-    const ocsAdj = new Map();
-    ocsNodes.forEach(o => ocsAdj.set(o.id, []));
-
-    ocsOcsLinks.forEach(l => {
-      ocsAdj.get(l.src).push(l.dst);
-      ocsAdj.get(l.dst).push(l.src);
-    });
-
-    ocsAdj.forEach(list => list.sort((a, b) => a - b));
-
-    /*
-     * Core OCS candidates:
-     *   - OCS nodes with no direct EPS/Host attachment.
-     *   - If none exists, pick highest OCS-degree node.
-     */
-    let roots = ocsNodes
-      .filter(o => nonOcsDegree(o.id) === 0)
-      .map(o => o.id)
-      .sort((a, b) => a - b);
-
-    if (!roots.length) {
-      let best = ocsNodes[0].id;
-
-      ocsNodes.forEach(o => {
-        const d = ocsDegree(o.id);
-        const bd = ocsDegree(best);
-
-        if (d > bd || (d === bd && o.id < best)) {
-          best = o.id;
-        }
-      });
-
-      roots = [best];
-    }
-
-    const level = new Map();
-    const parent = new Map();
-    const queue = [];
-
-    roots.forEach(r => {
-      level.set(r, 0);
-      queue.push(r);
-    });
-
-    while (queue.length) {
-      const u = queue.shift();
-
-      (ocsAdj.get(u) || []).forEach(v => {
-        if (!level.has(v)) {
-          level.set(v, level.get(u) + 1);
-          parent.set(v, u);
-          queue.push(v);
-        }
-      });
-    }
-
-    /*
-     * Disconnected OCS fallback.
-     */
-    ocsNodes.forEach(o => {
-      if (!level.has(o.id)) {
-        level.set(o.id, 0);
-        roots.push(o.id);
-      }
-    });
-
-    const ocsChildren = new Map();
-    ocsNodes.forEach(o => ocsChildren.set(o.id, []));
-
-    parent.forEach((p, child) => {
-      if (ocsChildren.has(p)) {
-        ocsChildren.get(p).push(child);
-      }
-    });
-
-    ocsChildren.forEach(list => list.sort((a, b) => a - b));
-
-    const hostsByEps = new Map();
-    epsNodes.forEach(e => hostsByEps.set(e.id, []));
-
-    hostNodes.forEach(h => {
-      const p = hostParent(h.id);
-      if (hostsByEps.has(p)) {
-        hostsByEps.get(p).push(h.id);
-      }
-    });
-
-    hostsByEps.forEach(list => list.sort((a, b) => a - b));
-
-    const epsByOcs = new Map();
-    const directHostsByOcs = new Map();
-
-    ocsNodes.forEach(o => {
-      epsByOcs.set(o.id, []);
-      directHostsByOcs.set(o.id, []);
-    });
-
-    epsNodes.forEach(e => {
-      const p = epsParentOcs(e.id);
-      if (p !== null && epsByOcs.has(p)) {
-        epsByOcs.get(p).push(e.id);
-      }
-    });
-
-    hostNodes.forEach(h => {
-      const p = hostParent(h.id);
-
-      /*
-       * If host is under EPS, do not also place it under OCS.
-       */
-      if (typeOf(p) === 'eps') {
-        return;
-      }
-
-      if (p !== null && directHostsByOcs.has(p)) {
-        directHostsByOcs.get(p).push(h.id);
-      }
-    });
-
-    epsByOcs.forEach(list => list.sort((a, b) => {
-      const pa = minConnectedOcsPort(a);
-      const pb = minConnectedOcsPort(b);
-      return pa - pb || a - b;
-    }));
-
-    directHostsByOcs.forEach(list => list.sort((a, b) => a - b));
-
-    const hostGap = 48;
-    const epsGap = 130;
-    const blockGap = 60;
-    const leftPad = 44;
-    const minBlockWidth = 168;
-
-    function localBlockWidth(ocsId) {
-      const directHosts = directHostsByOcs.get(ocsId) || [];
-      const epsList = epsByOcs.get(ocsId) || [];
-
-      let width = 0;
-
-      if (directHosts.length) {
-        width += Math.max(minBlockWidth, directHosts.length * hostGap + 28);
-      }
-
-      if (epsList.length) {
-        const epsWidths = epsList.map(eid => {
-          const hs = hostsByEps.get(eid) || [];
-          return Math.max(120, Math.max(1, hs.length) * hostGap + 24);
-        });
-
-        width += epsWidths.reduce((a, b) => a + b, 0);
-        width += Math.max(0, epsWidths.length - 1) * 24;
-      }
-
-      if (directHosts.length && epsList.length) {
-        width += 40;
-      }
-
-      return Math.max(minBlockWidth, width);
-    }
-
-    /*
-     * Anchor OCS:
-     *   - OCS with direct EPS/Host attachment.
-     *   - OCS with no OCS children.
-     *
-     * These determine horizontal blocks.
-     */
-    const anchorOcs = ocsNodes
-      .filter(o => {
-        const hasLocal = nonOcsDegree(o.id) > 0;
-        const hasChild = (ocsChildren.get(o.id) || []).length > 0;
-        return hasLocal || !hasChild;
-      })
-      .sort((a, b) => {
-        const la = level.get(a.id) ?? 0;
-        const lb = level.get(b.id) ?? 0;
-        return la - lb || a.id - b.id;
-      });
-
-    const anchorInfo = anchorOcs.map(o => ({
-      id: o.id,
-      width: localBlockWidth(o.id)
-    }));
-
-    const canvasWidth = Math.max(
-      520,
-      leftPad * 2 +
-      anchorInfo.reduce((sum, a) => sum + a.width, 0) +
-      Math.max(0, anchorInfo.length - 1) * blockGap
-    );
-
-    let cursor = leftPad;
-
-    anchorInfo.forEach(a => {
-      const x = cursor + a.width / 2;
-
-      pos.set(a.id, {
-        x,
-        y: 48 + (level.get(a.id) || 0) * 84,
-        type: 'ocs'
-      });
-
-      cursor += a.width + blockGap;
-    });
-
-    /*
-     * Place non-anchor OCS by averaging child x.
-     * This places core OCS above access OCSs.
-     */
-    const ocsIdsByDescendingLevel = ocsNodes
-      .map(o => o.id)
-      .sort((a, b) => {
-        const la = level.get(a) ?? 0;
-        const lb = level.get(b) ?? 0;
-        return lb - la || a - b;
-      });
-
-    ocsIdsByDescendingLevel.forEach(id => {
-      if (pos.has(id)) return;
-
-      const children = ocsChildren.get(id) || [];
-      const childXs = children
-        .map(c => pos.get(c))
-        .filter(Boolean)
-        .map(p => p.x);
-
-      let x;
-
-      if (childXs.length) {
-        x = childXs.reduce((a, b) => a + b, 0) / childXs.length;
-      } else {
-        x = canvasWidth / 2;
-      }
-
-      pos.set(id, {
-        x,
-        y: 48 + (level.get(id) || 0) * 84,
-        type: 'ocs'
-      });
-    });
-
-    /*
-     * If parent was computed after children, some parents may still need centering.
-     */
-    const ocsIdsByAscendingLevel = ocsNodes
-      .map(o => o.id)
-      .sort((a, b) => {
-        const la = level.get(a) ?? 0;
-        const lb = level.get(b) ?? 0;
-        return la - lb || a - b;
-      });
-
-    ocsIdsByAscendingLevel.forEach(id => {
-      const children = ocsChildren.get(id) || [];
-      const childXs = children
-        .map(c => pos.get(c))
-        .filter(Boolean)
-        .map(p => p.x);
-
-      if (childXs.length) {
-        const p = pos.get(id);
-        p.x = childXs.reduce((a, b) => a + b, 0) / childXs.length;
-      }
-    });
-
-    /*
-     * Place local EPS and direct hosts under each access OCS.
-     */
-    let maxY = 0;
-
-    ocsNodes.forEach(o => {
-      const oid = o.id;
-      const oPos = pos.get(oid);
-      if (!oPos) return;
-
-      maxY = Math.max(maxY, oPos.y);
-
-      const directHosts = directHostsByOcs.get(oid) || [];
-      const epsList = epsByOcs.get(oid) || [];
-
-      const localY = oPos.y + 84;
-      const hostUnderEpsY = localY + 72;
-
-      let localItems = [];
-
-      if (directHosts.length) {
-        const w = Math.max(minBlockWidth, directHosts.length * hostGap + 28);
-        localItems.push({
-          kind: 'directHosts',
-          ids: directHosts,
-          width: w
-        });
-      }
-
-      epsList.forEach(eid => {
-        const hs = hostsByEps.get(eid) || [];
-        const w = Math.max(120, Math.max(1, hs.length) * hostGap + 24);
-        localItems.push({
-          kind: 'eps',
-          id: eid,
-          hosts: hs,
-          width: w
-        });
-      });
-
-      if (!localItems.length) return;
-
-      const totalW = localItems.reduce((sum, item) => sum + item.width, 0) +
-        Math.max(0, localItems.length - 1) * 24;
-
-      let localCursor = oPos.x - totalW / 2;
-
-      localItems.forEach(item => {
-        const centerX = localCursor + item.width / 2;
-
-        if (item.kind === 'directHosts') {
-          const ids = item.ids;
-          const startX = centerX - ((ids.length - 1) * hostGap) / 2;
-
-          ids.forEach((hid, idx) => {
-            pos.set(hid, {
-              x: startX + idx * hostGap,
-              y: localY,
-              type: 'rnic'
-            });
-          });
-
-          maxY = Math.max(maxY, localY);
-        }
-
-        if (item.kind === 'eps') {
-          pos.set(item.id, {
-            x: centerX,
-            y: localY,
-            type: 'eps'
-          });
-
-          const hs = item.hosts || [];
-          const startX = centerX - ((hs.length - 1) * hostGap) / 2;
-
-          hs.forEach((hid, idx) => {
-            pos.set(hid, {
-              x: startX + idx * hostGap,
-              y: hostUnderEpsY,
-              type: 'rnic'
-            });
-          });
-
-          maxY = Math.max(maxY, hostUnderEpsY);
-        }
-
-        localCursor += item.width + 24;
-      });
-    });
-
-    /*
-     * Fallback for any unplaced EPS / hosts.
-     */
-    const unplaced = nodes
-      .filter(n => !pos.has(n.id))
-      .sort((a, b) => a.id - b.id);
-
-    if (unplaced.length) {
-      const y = maxY + 74;
-      const gap = 54;
-      const startX = canvasWidth / 2 - ((unplaced.length - 1) * gap) / 2;
-
-      unplaced.forEach((n, idx) => {
-        pos.set(n.id, {
-          x: startX + idx * gap,
-          y,
-          type: n.type || 'rnic'
-        });
-      });
-
-      maxY = y;
-    }
-
-    return {
-      pos,
-      width: canvasWidth,
-      height: maxY + 48
-    };
-  }
-
-  /*
-   * Case 3: EPS-only topology.
-   */
-  if (epsNodes.length && !ocsNodes.length) {
-    const hostGap = 50;
-    const minBlockWidth = 168;
-    const blockGap = 34;
-    const leftPad = 42;
-    const epsY = 54;
-    const hostY = 144;
-
-    const hostsByEps = new Map();
-    epsNodes.forEach(e => hostsByEps.set(e.id, []));
-
-    hostNodes.forEach(h => {
-      const p = hostParent(h.id);
-      if (hostsByEps.has(p)) {
-        hostsByEps.get(p).push(h.id);
-      }
-    });
-
-    hostsByEps.forEach(list => list.sort((a, b) => a - b));
-
-    const blocks = epsNodes.map(e => {
-      const children = hostsByEps.get(e.id) || [];
-
-      return {
-        epsId: e.id,
-        children,
-        width: Math.max(minBlockWidth, Math.max(1, children.length) * hostGap + 28)
-      };
-    });
-
-    const canvasWidth = Math.max(
-      460,
-      leftPad * 2 +
-      blocks.reduce((s, b) => s + b.width, 0) +
-      Math.max(0, blocks.length - 1) * blockGap
-    );
-
-    let cursor = leftPad;
-
-    blocks.forEach(block => {
-      const centerX = cursor + block.width / 2;
-
-      pos.set(block.epsId, {
-        x: centerX,
-        y: epsY,
-        type: 'eps'
-      });
-
-      const startX = centerX - ((block.children.length - 1) * hostGap) / 2;
-
-      block.children.forEach((hid, idx) => {
-        pos.set(hid, {
-          x: startX + idx * hostGap,
-          y: hostY,
-          type: 'rnic'
-        });
-      });
-
-      cursor += block.width + blockGap;
-    });
-
-    return {
-      pos,
-      width: canvasWidth,
-      height: 190
-    };
-  }
-
-  /*
-   * Case 4: fallback flat layout.
-   */
-  const gap = 64;
-  const width = Math.max(420, nodes.length * gap + 80);
-  const y = 70;
-
-  nodes
-    .slice()
-    .sort((a, b) => a.id - b.id)
-    .forEach((n, idx) => {
-      pos.set(n.id, {
-        x: 40 + idx * gap,
-        y,
-        type: n.type || 'rnic'
-      });
-    });
+  });
 
   return {
     pos,
-    width,
-    height: 140
+    width: graphLayout.width,
+    height: graphLayout.height
   };
 }
+
 
 function buildTimeIntervals(schedule) {
   if (schedule.mode === 'map') {
@@ -1368,7 +1016,16 @@ function renderActiveExternalSegments(pos, portMap, conn, color) {
     // highlighted by coloring the existing physical edge segments up to the
     // OCS node, while the actual OCS port-pair is shown as a text annotation
     // above the OCS. Do not draw an internal line inside the device icon.
-    return `<line class="link-active-colored" style="stroke:${color}" x1="${peerPos.x}" y1="${peerPos.y}" x2="${center.x}" y2="${center.y}" />`;
+    return `<line
+      class="link-active-colored topology-edge"
+      data-src-node="${peer.node}"
+      data-dst-node="${conn.ocs}"
+      style="stroke:${color}"
+      x1="${peerPos.x}"
+      y1="${peerPos.y}"
+      x2="${center.x}"
+      y2="${center.y}"
+    />`;
   }).join('');
 }
 
@@ -1384,6 +1041,234 @@ function renderSliceTopology(exp) {
   }
 
   root.innerHTML = intervals.map(interval => renderOneInterval(topology, interval)).join('');
+  initializeTopologyInteractions(root);
+}
+
+function initializeTopologyInteractions(root) {
+  root.querySelectorAll('.interval-panel').forEach(panel => {
+    const viewport = panel.querySelector('.topology-viewport');
+    const svg = panel.querySelector('.topology-svg');
+    const zoomLabel = panel.querySelector('.topology-zoom-label');
+
+    if (!viewport || !svg) return;
+
+    const baseWidth = Number(svg.getAttribute('width')) || 1;
+    const baseHeight = Number(svg.getAttribute('height')) || 1;
+    const contentOffsetX = Number(svg.dataset.contentOffsetX || 0);
+    const contentOffsetY = Number(svg.dataset.contentOffsetY || 0);
+    const contentWidth = Number(svg.dataset.contentWidth || baseWidth);
+    const contentHeight = Number(svg.dataset.contentHeight || baseHeight);
+    const minZoom = 0.5;
+    const maxZoom = 3.0;
+    const zoomStep = 0.2;
+    let zoom = 1.0;
+
+    /*
+     * Keep the visible time-slice panel height independent from zoom.
+     * Only the SVG content changes size; the viewport remains stable and
+     * becomes scrollable when the topology is larger than the viewport.
+     */
+    const initialViewportHeight = Math.min(
+      520,
+      Math.max(210, Math.ceil(contentHeight))
+    );
+    viewport.style.height = `${initialViewportHeight}px`;
+
+    const nodePositions = new Map();
+
+    svg.querySelectorAll('[data-node-id][data-node-x][data-node-y]').forEach(el => {
+      const nodeId = Number(el.dataset.nodeId);
+      if (!Number.isFinite(nodeId)) return;
+
+      nodePositions.set(nodeId, {
+        x: Number(el.dataset.nodeX),
+        y: Number(el.dataset.nodeY),
+        initialX: Number(el.dataset.nodeX),
+        initialY: Number(el.dataset.nodeY)
+      });
+    });
+
+    const refreshEdgesAndAnnotations = () => {
+      svg.querySelectorAll('.topology-edge[data-src-node][data-dst-node]').forEach(line => {
+        const src = nodePositions.get(Number(line.dataset.srcNode));
+        const dst = nodePositions.get(Number(line.dataset.dstNode));
+
+        if (!src || !dst) return;
+
+        line.setAttribute('x1', src.x);
+        line.setAttribute('y1', src.y);
+        line.setAttribute('x2', dst.x);
+        line.setAttribute('y2', dst.y);
+      });
+
+      svg.querySelectorAll('.port-annotation[data-node-id]').forEach(label => {
+        const p = nodePositions.get(Number(label.dataset.nodeId));
+        if (!p) return;
+
+        label.setAttribute('x', p.x);
+        label.setAttribute('y', p.y + Number(label.dataset.offsetY || 0));
+      });
+    };
+
+    const applyZoom = (nextZoom, preserveCenter = true) => {
+      const previousWidth = svg.getBoundingClientRect().width || baseWidth;
+      const centerRatioX = previousWidth > 0
+        ? (viewport.scrollLeft + viewport.clientWidth / 2) / previousWidth
+        : 0.5;
+      const previousHeight = svg.getBoundingClientRect().height || 1;
+      const centerRatioY = previousHeight > 0
+        ? (viewport.scrollTop + viewport.clientHeight / 2) / previousHeight
+        : 0.5;
+
+      zoom = Math.max(minZoom, Math.min(maxZoom, nextZoom));
+      svg.style.width = `${Math.round(baseWidth * zoom)}px`;
+      svg.style.height = `${Math.round(baseHeight * zoom)}px`;
+
+      if (zoomLabel) {
+        zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
+      }
+
+      requestAnimationFrame(() => {
+        if (preserveCenter) {
+          viewport.scrollLeft = centerRatioX * svg.getBoundingClientRect().width - viewport.clientWidth / 2;
+          viewport.scrollTop = centerRatioY * svg.getBoundingClientRect().height - viewport.clientHeight / 2;
+          return;
+        }
+
+        // The SVG includes a large drag workspace around the automatically
+        // laid-out topology. Start each slice centered on the actual content,
+        // rather than on the empty top-left workspace.
+        viewport.scrollLeft = (contentOffsetX + contentWidth / 2) * zoom - viewport.clientWidth / 2;
+        viewport.scrollTop = (contentOffsetY + contentHeight / 2) * zoom - viewport.clientHeight / 2;
+      });
+    };
+
+    panel.querySelectorAll('[data-topology-action]').forEach(button => {
+      button.addEventListener('click', () => {
+        const action = button.dataset.topologyAction;
+
+        if (action === 'zoom-in') applyZoom(zoom + zoomStep);
+        if (action === 'zoom-out') applyZoom(zoom - zoomStep);
+        if (action === 'zoom-reset') applyZoom(1.0);
+
+        if (action === 'layout-reset') {
+          svg.querySelectorAll('.topology-draggable').forEach(group => {
+            group.dataset.translateX = '0';
+            group.dataset.translateY = '0';
+            group.removeAttribute('transform');
+          });
+
+          nodePositions.forEach(p => {
+            p.x = p.initialX;
+            p.y = p.initialY;
+          });
+
+          refreshEdgesAndAnnotations();
+        }
+      });
+    });
+
+    viewport.addEventListener('wheel', event => {
+      if (!event.ctrlKey && !event.metaKey) return;
+
+      event.preventDefault();
+      applyZoom(zoom + (event.deltaY < 0 ? zoomStep : -zoomStep));
+    }, {passive: false});
+
+    svg.querySelectorAll('.topology-draggable').forEach(group => {
+      group.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+
+        const ctm = svg.getScreenCTM();
+        if (!ctm) return;
+
+        const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(ctm.inverse());
+        const nodeIds = String(group.dataset.dragNodeIds || '')
+          .split(',')
+          .map(v => Number(v))
+          .filter(Number.isFinite);
+
+        const startPositions = new Map();
+        nodeIds.forEach(nodeId => {
+          const p = nodePositions.get(nodeId);
+          if (p) startPositions.set(nodeId, {x: p.x, y: p.y});
+        });
+
+        const baseTranslateX = Number(group.dataset.translateX || 0);
+        const baseTranslateY = Number(group.dataset.translateY || 0);
+
+        group.classList.add('is-dragging');
+        group.setPointerCapture(event.pointerId);
+        event.preventDefault();
+        event.stopPropagation();
+
+        const onPointerMove = moveEvent => {
+          // Auto-scroll the fixed viewport while a node is dragged near an
+          // edge. Combined with the padded SVG workspace, this allows nodes
+          // to be moved far beyond the original automatic-layout area.
+          const viewportRect = viewport.getBoundingClientRect();
+          const edgeZone = 42;
+          const maxScrollStep = 26;
+          let scrollDx = 0;
+          let scrollDy = 0;
+
+          if (moveEvent.clientX < viewportRect.left + edgeZone) {
+            scrollDx = -maxScrollStep * (1 - Math.max(0, moveEvent.clientX - viewportRect.left) / edgeZone);
+          } else if (moveEvent.clientX > viewportRect.right - edgeZone) {
+            scrollDx = maxScrollStep * (1 - Math.max(0, viewportRect.right - moveEvent.clientX) / edgeZone);
+          }
+
+          if (moveEvent.clientY < viewportRect.top + edgeZone) {
+            scrollDy = -maxScrollStep * (1 - Math.max(0, moveEvent.clientY - viewportRect.top) / edgeZone);
+          } else if (moveEvent.clientY > viewportRect.bottom - edgeZone) {
+            scrollDy = maxScrollStep * (1 - Math.max(0, viewportRect.bottom - moveEvent.clientY) / edgeZone);
+          }
+
+          if (scrollDx || scrollDy) {
+            viewport.scrollLeft += scrollDx;
+            viewport.scrollTop += scrollDy;
+          }
+
+          const moveCtm = svg.getScreenCTM();
+          if (!moveCtm) return;
+
+          const current = new DOMPoint(moveEvent.clientX, moveEvent.clientY)
+            .matrixTransform(moveCtm.inverse());
+          const dx = current.x - point.x;
+          const dy = current.y - point.y;
+          const translateX = baseTranslateX + dx;
+          const translateY = baseTranslateY + dy;
+
+          group.dataset.translateX = String(translateX);
+          group.dataset.translateY = String(translateY);
+          group.setAttribute('transform', `translate(${translateX} ${translateY})`);
+
+          startPositions.forEach((start, nodeId) => {
+            const p = nodePositions.get(nodeId);
+            if (!p) return;
+            p.x = start.x + dx;
+            p.y = start.y + dy;
+          });
+
+          refreshEdgesAndAnnotations();
+        };
+
+        const finishDrag = () => {
+          group.classList.remove('is-dragging');
+          group.removeEventListener('pointermove', onPointerMove);
+          group.removeEventListener('pointerup', finishDrag);
+          group.removeEventListener('pointercancel', finishDrag);
+        };
+
+        group.addEventListener('pointermove', onPointerMove);
+        group.addEventListener('pointerup', finishDrag);
+        group.addEventListener('pointercancel', finishDrag);
+      });
+    });
+
+    applyZoom(1.0, false);
+    refreshEdgesAndAnnotations();
+  });
 }
 
 function renderOneInterval(topology, interval) {
@@ -1402,7 +1287,15 @@ function renderOneInterval(topology, interval) {
 
     if (!a || !b) return '';
 
-    return `<line class="link-physical" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" />`;
+    return `<line
+      class="link-physical topology-edge"
+      data-src-node="${l.src}"
+      data-dst-node="${l.dst}"
+      x1="${a.x}"
+      y1="${a.y}"
+      x2="${b.x}"
+      y2="${b.y}"
+    />`;
   }).join('');
 
   const activeExternalLines = (interval.connections || []).map(c => {
@@ -1420,9 +1313,15 @@ function renderOneInterval(topology, interval) {
 
       if (n.type === 'ocs') {
         return `
-          <g class="node-group node-group-ocs">
+          <g
+            class="node-group node-group-ocs topology-draggable"
+            data-drag-node-ids="${n.id}"
+            data-node-id="${n.id}"
+            data-node-x="${p.x}"
+            data-node-y="${p.y}"
+          >
             <title>OCS ${n.id}</title>
-            <rect class="node-ocs" x="${p.x - 20}" y="${p.y - 20}" width="40" height="40" rx="7" transform="rotate(45 ${p.x} ${p.y})"/>
+            <rect class="node-ocs" x="${p.x - 14}" y="${p.y - 14}" width="28" height="28" rx="5" transform="rotate(45 ${p.x} ${p.y})"/>
             <text class="node-label node-label-ocs" x="${p.x}" y="${p.y}">O${n.id}</text>
           </g>
         `;
@@ -1430,44 +1329,84 @@ function renderOneInterval(topology, interval) {
 
       if (n.type === 'eps') {
         return `
-          <g class="node-group node-group-eps">
+          <g
+            class="node-group node-group-eps topology-draggable"
+            data-drag-node-ids="${n.id}"
+            data-node-id="${n.id}"
+            data-node-x="${p.x}"
+            data-node-y="${p.y}"
+          >
             <title>EPS ${n.id}</title>
-            <rect class="node-eps" x="${p.x - 28}" y="${p.y - 16}" width="56" height="32" rx="9"/>
+            <rect class="node-eps" x="${p.x - 19}" y="${p.y - 11}" width="38" height="22" rx="7"/>
             <text class="node-label node-label-eps" x="${p.x}" y="${p.y}">E${n.id}</text>
           </g>
         `;
       }
 
       return `
-        <g class="node-group node-group-host">
-          <circle class="node-rnic" cx="${p.x}" cy="${p.y}" r="18"/>
+        <g
+          class="node-group node-group-host topology-draggable"
+          data-drag-node-ids="${n.id}"
+          data-node-id="${n.id}"
+          data-node-x="${p.x}"
+          data-node-y="${p.y}"
+        >
+          <circle class="node-rnic" cx="${p.x}" cy="${p.y}" r="12"/>
           <text class="node-label node-label-host" x="${p.x}" y="${p.y}">H${n.id}</text>
         </g>
       `;
     }).join('');
 
   const logicalNodeEls = logicalBoxes.map(box => {
-    const endpointEls = (box.endpoints || []).map(ep => {
-      const p = pos.get(Number(ep.carrierNodeId));
-      if (!p) return '';
-      const label = ep.label || `P${ep.planeId}`;
-      const title = `Endpoint ${ep.token}\nLogical node: ${ep.logicalId}\nRNIC group: ${ep.rnicGroupId}\nPlane: ${ep.planeId}\nCarrier RNIC: ${ep.carrierNodeId}`;
+    const nicEls = (box.nics || []).map(nic => {
+      const endpointEls = (nic.endpoints || []).map(ep => {
+        const p = pos.get(Number(ep.carrierNodeId));
+        if (!p) return '';
+        const label = ep.label || `P${ep.planeId}`;
+        const title = `Endpoint ${ep.token}
+Logical node: ${ep.logicalId}
+NIC: ${ep.rnicGroupId}
+Plane: ${ep.planeId}
+Carrier RNIC: ${ep.carrierNodeId}`;
+
+        return `
+          <g
+            class="logical-endpoint-port"
+            data-node-id="${ep.carrierNodeId}"
+            data-node-x="${p.x}"
+            data-node-y="${p.y}"
+          >
+            <title>${escapeHtml(title)}</title>
+            <circle class="endpoint-port-dot" cx="${p.x}" cy="${p.y}" r="4"/>
+            <text class="endpoint-port-label" x="${p.x}" y="${p.y + 9}">${escapeHtml(label)}</text>
+          </g>
+        `;
+      }).join('');
+
+      const nicBottomY = nic.y + nic.height / 2;
+      const nodeTopY = box.y - box.nodeCardHeight / 2;
+
       return `
-        <g class="logical-endpoint-port">
-          <title>${escapeHtml(title)}</title>
-          <circle class="endpoint-port-dot" cx="${p.x}" cy="${p.y}" r="7"/>
-          <text class="endpoint-port-label" x="${p.x}" y="${p.y + 20}">${escapeHtml(label)}</text>
-          <text class="endpoint-token-label" x="${p.x}" y="${p.y + 34}">${escapeHtml(ep.token)}</text>
+        <g class="logical-nic-group">
+          <line class="logical-nic-link" x1="${nic.x}" y1="${nicBottomY}" x2="${box.x}" y2="${nodeTopY}"/>
+          <rect class="logical-nic-card" x="${nic.x - nic.width / 2}" y="${nic.y - nic.height / 2}" width="${nic.width}" height="${nic.height}" rx="6"/>
+          <text class="logical-nic-title" x="${nic.x}" y="${nic.y + 7}">NIC ${nic.nicId}</text>
+          ${endpointEls}
         </g>
       `;
     }).join('');
 
+    const carrierNodeIds = (box.endpoints || []).map(ep => Number(ep.carrierNodeId)).join(',');
+
     return `
-      <g class="logical-node-group">
+      <g
+        class="logical-node-group topology-draggable"
+        data-drag-node-ids="${carrierNodeIds}"
+      >
         <title>${escapeHtml(box.label)}</title>
-        <rect class="logical-node-card" x="${box.x - box.width / 2}" y="${box.y - box.height / 2}" width="${box.width}" height="${box.height}" rx="12"/>
-        <text class="logical-node-title" x="${box.x}" y="${box.y + 22}">${escapeHtml(box.label)}</text>
-        ${endpointEls}
+        <rect class="logical-node-card" x="${box.x - box.nodeCardWidth / 2}" y="${box.y - box.nodeCardHeight / 2}" width="${box.nodeCardWidth}" height="${box.nodeCardHeight}" rx="6"/>
+        <text class="logical-node-title" x="${box.x}" y="${box.y}">${escapeHtml(box.label)}</text>
+        ${nicEls}
       </g>
     `;
   }).join('');
@@ -1484,7 +1423,15 @@ function renderOneInterval(topology, interval) {
 
       return pairs.map((c, idx) => {
         const color = colorForConnectionComponent(componentOf, c);
-        return `<text class="port-annotation" style="fill:${color}" x="${p.x}" y="${p.y - 28 - idx * 11}">${c.a}↔${c.b}</text>`;
+        const offsetY = -22 - idx * 10;
+        return `<text
+          class="port-annotation"
+          data-node-id="${n.id}"
+          data-offset-y="${offsetY}"
+          style="fill:${color}"
+          x="${p.x}"
+          y="${p.y + offsetY}"
+        >${c.a}↔${c.b}</text>`;
       }).join('');
     }).join('');
 
@@ -1499,6 +1446,28 @@ function renderOneInterval(topology, interval) {
     ? 'static'
     : `${fmtNs(interval.startNs)} – ${fmtNs(interval.stableEndNs)}`;
 
+  // Keep a substantial workspace around the automatic layout so nodes can be
+  // rearranged well beyond their original positions without being clipped by
+  // the SVG boundary. The viewport starts centered on the actual topology.
+  const dragPaddingX = Math.max(360, Math.min(900, Math.round(width * 0.6)));
+  const dragPaddingY = Math.max(240, Math.min(600, Math.round(height * 0.8)));
+  const canvasWidth = width + dragPaddingX * 2;
+  const canvasHeight = height + dragPaddingY * 2;
+
+  const topologyLegend = logicalEndpointView
+    ? `
+      <span><span class="legend-shape legend-plane"></span>Plane</span>
+      <span><span class="legend-shape legend-nic"></span>NIC</span>
+      <span><span class="legend-shape legend-node"></span>Node</span>
+      <span><span class="legend-shape legend-eps"></span>EPS</span>
+      <span><span class="legend-shape legend-ocs"></span>OCS</span>
+    `
+    : `
+      <span><span class="legend-shape legend-host"></span>RNIC</span>
+      <span><span class="legend-shape legend-eps"></span>EPS</span>
+      <span><span class="legend-shape legend-ocs"></span>OCS</span>
+    `;
+
   return `
     <div class="slice-panel interval-panel">
       <div class="slice-title">
@@ -1506,16 +1475,39 @@ function renderOneInterval(topology, interval) {
         <span>${timeLabel}</span>
       </div>
       <div class="mapping-legend">${mappingLegend}</div>
-      <svg class="topology-svg" viewBox="0 0 ${width} ${height}" role="img">
-        ${physical}
-        ${activeExternalLines}
-        ${nodeEls}
-        ${portAnnotations}
-      </svg>
+      <div class="topology-toolbar" aria-label="Topology controls">
+        <button type="button" class="topology-tool-button" data-topology-action="zoom-out" title="Zoom out">−</button>
+        <button type="button" class="topology-zoom-label" data-topology-action="zoom-reset" title="Reset zoom">100%</button>
+        <button type="button" class="topology-tool-button" data-topology-action="zoom-in" title="Zoom in">+</button>
+        <button type="button" class="topology-reset-layout" data-topology-action="layout-reset" title="Reset dragged node positions">Reset layout</button>
+      </div>
+      <div
+        class="topology-viewport"
+        tabindex="0"
+        aria-label="${escapeHtml(`${title} topology. Scroll, zoom, or drag nodes to inspect the topology.`)}"
+      >
+        <svg
+          class="topology-svg"
+          viewBox="0 0 ${canvasWidth} ${canvasHeight}"
+          width="${canvasWidth}"
+          height="${canvasHeight}"
+          data-content-offset-x="${dragPaddingX}"
+          data-content-offset-y="${dragPaddingY}"
+          data-content-width="${width}"
+          data-content-height="${height}"
+          role="img"
+          aria-label="${escapeHtml(`${title} topology`)}"
+        >
+          <g class="topology-canvas" transform="translate(${dragPaddingX} ${dragPaddingY})">
+            ${physical}
+            ${activeExternalLines}
+            ${nodeEls}
+            ${portAnnotations}
+          </g>
+        </svg>
+      </div>
       <div class="topology-node-legend">
-        <span><span class="legend-shape legend-host"></span>${logicalEndpointView ? 'Logical node / endpoint' : 'RNIC'}</span>
-        <span><span class="legend-shape legend-eps"></span>EPS</span>
-        <span><span class="legend-shape legend-ocs"></span>OCS</span>
+        ${topologyLegend}
       </div>
     </div>
   `;
