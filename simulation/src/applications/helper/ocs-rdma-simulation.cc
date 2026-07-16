@@ -164,6 +164,72 @@ std::vector<Ipv4Address> serverAddress;
 // maintain port number for each host pair
 std::unordered_map<uint32_t, unordered_map<uint32_t, uint16_t>> portNumder;
 
+typedef std::pair<uint16_t, std::pair<uint32_t, uint32_t>> FlowCompletionKey;
+
+struct FlowCompletionRegistration
+{
+  FlowCompletionRegistration()
+      : tag(0)
+  {
+  }
+
+  FlowCompletionRegistration(
+      uint32_t flowTag,
+      OcsRdmaSimulation::FlowCompletionCallback flowCompletion)
+      : tag(flowTag),
+        completion(flowCompletion)
+  {
+  }
+
+  uint32_t tag;
+  OcsRdmaSimulation::FlowCompletionCallback completion;
+};
+
+std::map<FlowCompletionKey, FlowCompletionRegistration> flowCompletionCallbacks;
+
+uint16_t
+StartResolvedFlow(uint32_t src,
+                  uint32_t dst,
+                  uint32_t priorityGroup,
+                  uint32_t destinationPort,
+                  uint64_t bytes,
+                  uint32_t tag,
+                  OcsRdmaSimulation::FlowCompletionCallback completion)
+{
+  NS_ASSERT_MSG(src < n.GetN(), "flow src carrier node id out of range");
+  NS_ASSERT_MSG(dst < n.GetN(), "flow dst carrier node id out of range");
+  NS_ASSERT_MSG(n.Get(src)->GetNodeType() == 0, "flow src is not host");
+  NS_ASSERT_MSG(n.Get(dst)->GetNodeType() == 0, "flow dst is not host");
+  NS_ASSERT_MSG(bytes > 0, "RDMA flow size must be greater than zero");
+  NS_ASSERT_MSG(
+      bytes <= std::numeric_limits<uint32_t>::max(),
+      "current RdmaClientHelper supports at most UINT32_MAX bytes per flow");
+
+  uint16_t port = portNumder[src][dst]++;
+  if (!completion.IsNull())
+  {
+    FlowCompletionKey key =
+        std::make_pair(port, std::make_pair(src, dst));
+    flowCompletionCallbacks[key] =
+        FlowCompletionRegistration(tag, completion);
+  }
+
+  RdmaClientHelper clientHelper(
+      priorityGroup,
+      serverAddress[src],
+      serverAddress[dst],
+      port,
+      destinationPort,
+      static_cast<uint32_t>(bytes),
+      has_win
+          ? (global_t == 1 ? maxBdp : pairBdp[n.Get(src)][n.Get(dst)])
+          : 0,
+      global_t == 1 ? maxRtt : pairRtt[src][dst]);
+  ApplicationContainer appCon = clientHelper.Install(n.Get(src));
+  appCon.Start(Time(0));
+  return port;
+}
+
 struct FlowInput
 {
     FlowInput()
@@ -218,10 +284,14 @@ void ScheduleFlowInputs()
 {
 	while (flow_input.idx < flow_num && Seconds(flow_input.start_time) == Simulator::Now())
 	{
-		uint32_t port = portNumder[flow_input.src][flow_input.dst]++; // get a new port number
-		RdmaClientHelper clientHelper(flow_input.pg, serverAddress[flow_input.src], serverAddress[flow_input.dst], port, flow_input.dport, flow_input.maxPacketCount, has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(flow_input.src)][n.Get(flow_input.dst)]) : 0, global_t == 1 ? maxRtt : pairRtt[flow_input.src][flow_input.dst]);
-		ApplicationContainer appCon = clientHelper.Install(n.Get(flow_input.src));
-		appCon.Start(Time(0));
+		StartResolvedFlow(
+			flow_input.src,
+			flow_input.dst,
+			flow_input.pg,
+			flow_input.dport,
+			flow_input.maxPacketCount,
+			0,
+			OcsRdmaSimulation::FlowCompletionCallback());
 
 		// get the next flow input
 		flow_input.idx++;
@@ -264,6 +334,24 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q)
 	Ptr<Node> dstNode = n.Get(did);
 	Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
 	rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+
+	FlowCompletionKey completionKey =
+		std::make_pair(
+			static_cast<uint16_t>(q->sport),
+			std::make_pair(sid, did));
+	std::map<FlowCompletionKey, FlowCompletionRegistration>::iterator it =
+		flowCompletionCallbacks.find(completionKey);
+	if (it != flowCompletionCallbacks.end())
+	{
+		FlowCompletionRegistration registration = it->second;
+		flowCompletionCallbacks.erase(it);
+		registration.completion(
+			sid,
+			did,
+			q->m_size,
+			registration.tag,
+			static_cast<uint16_t>(q->sport));
+	}
 }
 
 void get_pfc(FILE *fout, Ptr<QbbNetDevice> dev, uint32_t type)
@@ -603,12 +691,66 @@ ResolveTopologyNodeToken(const std::string &token,
 } // namespace
 
 OcsRdmaSimulation::OcsRdmaSimulation()
+    : m_initialized(false)
 {
+}
+
+bool
+OcsRdmaSimulation::Initialize(const std::string &configFile,
+                              const std::string &traceSuffix)
+{
+  if (m_initialized)
+  {
+    std::cerr << "OCS/RDMA simulation is already initialized" << std::endl;
+    return false;
+  }
+  return ConfigureAndMaybeRun(configFile, traceSuffix, false, false) == 0;
+}
+
+uint16_t
+OcsRdmaSimulation::SubmitFlow(
+    const std::string &srcToken,
+    const std::string &dstToken,
+    uint64_t bytes,
+    uint32_t tag,
+    FlowCompletionCallback completion,
+    uint32_t priorityGroup,
+    uint32_t destinationPort)
+{
+  NS_ASSERT_MSG(m_initialized,
+                "Initialize() must be called before SubmitFlow()");
+
+  RdmaMultipathTransport::ScheduledFlow scheduled =
+      rdmaMultipathTransport.ScheduleFlow(srcToken, dstToken);
+  return StartResolvedFlow(
+      scheduled.srcCarrierNodeId,
+      scheduled.dstCarrierNodeId,
+      priorityGroup,
+      destinationPort,
+      bytes,
+      tag,
+      completion);
+}
+
+bool
+OcsRdmaSimulation::IsInitialized() const
+{
+  return m_initialized;
 }
 
 int
 OcsRdmaSimulation::RunStaticExperiment(const std::string &configFile,
                                        const std::string &traceSuffix)
+{
+  return ConfigureAndMaybeRun(configFile, traceSuffix, true, true);
+}
+
+int
+OcsRdmaSimulation::ConfigureAndMaybeRun(
+    const std::string &configFile,
+    const std::string &traceSuffix,
+    bool loadStaticFlows,
+    bool runSimulator)
 {
 	clock_t begint, endt;
 	begint = clock();
@@ -1063,7 +1205,10 @@ OcsRdmaSimulation::RunStaticExperiment(const std::string &configFile,
 
 	// set topology, flow and trace
 	topof.open(topology_file.c_str());
-	flowf.open(flow_file.c_str());
+	if (loadStaticFlows)
+	{
+		flowf.open(flow_file.c_str());
+	}
 	tracef.open(trace_file.c_str());
 	uint32_t node_num, switch_num, link_num, trace_num;
 	uint32_t ocs_num = 0;
@@ -1120,7 +1265,11 @@ OcsRdmaSimulation::RunStaticExperiment(const std::string &configFile,
 	std::cout << "TOPOLOGY_OCS\t\t\t" << ocs_num << "\n";
 	std::cout << "TOPOLOGY_LINKS\t\t\t" << link_num << "\n";
 
-	flowf >> flow_num;
+	flow_num = 0;
+	if (loadStaticFlows)
+	{
+		flowf >> flow_num;
+	}
 	tracef >> trace_num;
 
 	// Set node roles: 0 = host, 1 = packet switch, 2 = OCS.
@@ -1783,6 +1932,12 @@ OcsRdmaSimulation::RunStaticExperiment(const std::string &configFile,
 	FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
 	Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output, &n);
 
+	m_initialized = true;
+	if (!runSimulator)
+	{
+		return 0;
+	}
+
 	//
 	// Now, do the actual simulation.
 	//
@@ -1803,6 +1958,8 @@ OcsRdmaSimulation::RunStaticExperiment(const std::string &configFile,
 		}
 	}
 	Simulator::Destroy();
+	m_initialized = false;
+	flowCompletionCallbacks.clear();
 	NS_LOG_INFO("Done.");
 	fclose(trace_output);
 
