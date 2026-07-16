@@ -293,42 +293,6 @@ A dashboard-compatible experiment can be run and archived with:
 python3 scripts/run_dashboard_experiment.py --name exp_1
 ```
 
-## Dashboard
-![OCS/RDMA dashboard overview](dashboard/assets/dashboard-overview.png)
-
-This repository includes a lightweight web dashboard for visualizing OCS/RDMA experiments.
-
-```bash
-python3 dashboard/run_serve.py --host 0.0.0.0 --port 8000
-```
-
-Then open:
-
-```text
-http://<server-ip>:8000
-```
-
-The dashboard dynamically scans:
-
-```text
-simulation/experiments/
-```
-
-and visualizes archived experiments.
-
-The dashboard currently provides:
-
-- experiment index
-- topology by OCS time window
-- OCS schedule / fixed map visualization
-- flow and FCT result table
-- per-flow throughput timeline support
-- OCS forwarding/drop statistics
-- RNIC injection window table
-- CC mode / OCS mode / host count / EPS count / OCS count summary
-
-The dashboard does not require a manually maintained JSON index. Experiment metadata is generated dynamically by `dashboard/run_serve.py`.
-
 ## Debug
 
 1. The direct command to debug the original MP-RDMA simulator is:

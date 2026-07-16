@@ -21,7 +21,10 @@ CC_NAMES = {
 }
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SIM_DIR_DEFAULT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parent
+SIM_DIR_DEFAULT = REPO_ROOT / "simulation"
+DASHBOARD_DIR_DEFAULT = REPO_ROOT / "dashboard"
+EXPERIMENTS_DIR_DEFAULT = REPO_ROOT / "experiments" / "runs"
 
 
 @dataclass
@@ -1654,8 +1657,8 @@ def build_experiment(exp_dir: Path, bucket_ns: int):
     }
 
 
-def make_handler(sim_dir: Path, experiments_dir: Path, bucket_ns: int):
-    dashboard_dir = sim_dir / "dashboard"
+def make_handler(dashboard_dir: Path, experiments_dir: Path, bucket_ns: int):
+    dashboard_dir = Path(dashboard_dir).resolve()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -1723,7 +1726,8 @@ def main():
         description="Serve OCS/RDMA dashboard by dynamically scanning experiments/."
     )
     ap.add_argument("--sim-dir", default=str(SIM_DIR_DEFAULT))
-    ap.add_argument("--experiments-dir", default="experiments")
+    ap.add_argument("--dashboard-dir", default=str(DASHBOARD_DIR_DEFAULT))
+    ap.add_argument("--experiments-dir", default=str(EXPERIMENTS_DIR_DEFAULT))
     ap.add_argument("--bucket-ns", type=int, default=100_000)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
@@ -1731,11 +1735,17 @@ def main():
 
     sim_dir = Path(args.sim_dir).resolve()
 
+    dashboard_dir = Path(args.dashboard_dir)
+    if not dashboard_dir.is_absolute():
+        dashboard_dir = REPO_ROOT / dashboard_dir
+    dashboard_dir = dashboard_dir.resolve()
+
     exp_dir = Path(args.experiments_dir)
     if not exp_dir.is_absolute():
-        exp_dir = sim_dir / exp_dir
+        exp_dir = REPO_ROOT / exp_dir
+    exp_dir = exp_dir.resolve()
 
-    handler = make_handler(sim_dir, exp_dir, args.bucket_ns)
+    handler = make_handler(dashboard_dir, exp_dir, args.bucket_ns)
 
     class DashboardHTTPServer(ThreadingHTTPServer):
         allow_reuse_address = True
@@ -1745,6 +1755,7 @@ def main():
 
     print(f"[INFO] dashboard: http://{args.host}:{args.port}")
     print(f"[INFO] simulation dir: {sim_dir}")
+    print(f"[INFO] dashboard dir: {dashboard_dir}")
     print(f"[INFO] experiments dir: {exp_dir}")
     print("[INFO] press Ctrl+C to stop the dashboard server")
 

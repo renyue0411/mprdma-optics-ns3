@@ -8,7 +8,9 @@ from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SIM_DIR_DEFAULT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+SIM_DIR_DEFAULT = REPO_ROOT / "simulation"
+EXPERIMENTS_DIR_DEFAULT = REPO_ROOT / "experiments" / "runs"
 
 
 RUNLOG_PATH_KEYS = {
@@ -158,7 +160,7 @@ def main():
     ap.add_argument("--run-cmd", default=None)
     ap.add_argument("--configure", action="store_true")
     ap.add_argument("--no-run", action="store_true")
-    ap.add_argument("--experiments-dir", default="experiments")
+    ap.add_argument("--experiments-dir", default=str(EXPERIMENTS_DIR_DEFAULT))
 
     args = ap.parse_args()
 
@@ -170,7 +172,8 @@ def main():
 
     exp_root = Path(args.experiments_dir)
     if not exp_root.is_absolute():
-        exp_root = sim_dir / exp_root
+        exp_root = REPO_ROOT / exp_root
+    exp_root = exp_root.resolve()
 
     exp_id = make_exp_id(args.name)
     exp_dir = exp_root / exp_id
